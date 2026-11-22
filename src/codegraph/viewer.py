@@ -51,17 +51,26 @@ def layout_graph(nodes):
     by_file = defaultdict(list)
     for node in nodes:
         by_file[node["source_ref"]["path"]].append(node)
+    files = sorted(by_file.items())
+    for _, members in files:
+        members.sort(key=lambda node: (node["source_ref"]["start_line"], node["id"]))
+    return min(
+        (place_files(files, limit) for limit in range(750, 2191, COLUMN_STEP)),
+        key=lambda layout: max(layout[2][0] / 1.15, layout[2][1]),
+    )
+
+
+def place_files(files, limit):
     groups, positions = [], {}
     x = y = 18
     shelf_height = 0
     width = 0
-    for path, members in sorted(by_file.items()):
-        members.sort(key=lambda node: (node["source_ref"]["start_line"], node["id"]))
+    for path, members in files:
         columns = min(5, ceil(len(members) / 11))
         rows = ceil(len(members) / columns)
         group_width = (columns - 1) * COLUMN_STEP + NODE_WIDTH + 30
         group_height = (rows - 1) * ROW_STEP + NODE_HEIGHT + 47
-        if x > 18 and x + group_width > 1030:
+        if x > 18 and x + group_width > limit:
             x, y = 18, y + shelf_height + 20
             shelf_height = 0
         groups.append((path, x, y, x + group_width, y + group_height))
@@ -75,21 +84,48 @@ def layout_graph(nodes):
     return groups, positions, (width, y + shelf_height + 18)
 
 
-def edge_path(origin, destination):
+def edge_sides(origin, destination):
+    distance = destination[0] - origin[0]
+    if abs(distance) < NODE_WIDTH + 12:
+        return 1, 1
+    direction = 1 if distance > 0 else -1
+    return direction, -direction
+
+
+def edge_ports(edges, positions):
+    ports = {edge["id"]: [0, 0] for edge in edges}
+    channels = defaultdict(list)
+    for edge in edges:
+        start, end = edge["from_id"], edge["to_id"]
+        if start == end:
+            continue
+        origin, destination = positions[start], positions[end]
+        start_side, end_side = edge_sides(origin, destination)
+        channels[start, start_side].append((destination[1], destination[0], edge["id"], 0))
+        channels[end, end_side].append((origin[1], origin[0], edge["id"], 1))
+    for connected in channels.values():
+        if len(connected) < 2:
+            continue
+        for index, (_, _, edge_id, endpoint) in enumerate(sorted(connected)):
+            ports[edge_id][endpoint] = -10 + 20 * index / (len(connected) - 1)
+    return ports
+
+
+def edge_path(origin, destination, offsets):
     x1, y1 = origin
     x2, y2 = destination
     half = NODE_WIDTH / 2
     if origin == destination:
         right = x1 + half
         return right, y1 - 7, right + 21, y1 - 21, right + 21, y1 + 21, right, y1 + 7
-    if x1 == x2:
-        return x1 + half, y1, x1 + half + 11, y1, x2 + half + 11, y2, x2 + half, y2
-    direction = 1 if x1 < x2 else -1
-    start, end = x1 + direction * half, x2 - direction * half
-    if direction * (end - start) < 12:
+    y1 += offsets[0]
+    y2 += offsets[1]
+    start_side, end_side = edge_sides(origin, destination)
+    if start_side == end_side:
         gutter = max(x1, x2) + half + 11
         return x1 + half, y1, gutter, y1, gutter, y2, x2 + half, y2
-    bend = (start + end) / 2 + direction * min(8, abs(end - start) / 4)
+    start, end = x1 + start_side * half, x2 + end_side * half
+    bend = (start + end) / 2 + start_side * min(8, abs(end - start) / 4)
     return start, y1, bend, y1, bend, y2, end, y2
 
 
@@ -113,6 +149,8 @@ class Viewer:
         "selected": "#254c93", "related": "#dce9ff", "accent": "#254c93",
         "line": "#8798b3", "border": "#92a3bd", "group": "#edf1f7",
         "muted_fill": "#f3f5f9", "muted_ink": "#6e7c92", "muted_line": "#ccd5e3",
+        "caller": "#97501e", "caller_fill": "#fff0dc",
+        "both": "#694499", "both_fill": "#eee2fc",
     }
 
     def __init__(self, root, project: Project, tk, ttk):
@@ -160,7 +198,7 @@ class Viewer:
         self.symbols.bind("<<TreeviewSelect>>", self.selection_changed)
 
         graph.columnconfigure(0, weight=1)
-        graph.rowconfigure(1, weight=1)
+        graph.rowconfigure(2, weight=1)
         toolbar = ttk.Frame(graph, padding=(6, 4))
         toolbar.grid(row=0, column=0, sticky="ew")
         for label, action in (
@@ -168,8 +206,16 @@ class Viewer:
             ("+", lambda: self.zoom(1.25)), ("Clear focus", self.clear_focus),
         ):
             ttk.Button(toolbar, text=label, command=action).pack(side="left", padx=(0, 4))
+        legend = ttk.Frame(graph, padding=(7, 0, 7, 5))
+        legend.grid(row=1, column=0, sticky="ew")
+        self.callers_label = tk.StringVar()
+        self.callees_label = tk.StringVar()
+        ttk.Label(legend, textvariable=self.callers_label, foreground=self.COLORS["caller"]).pack(
+            side="left", padx=(0, 12)
+        )
+        ttk.Label(legend, textvariable=self.callees_label, foreground=self.COLORS["accent"]).pack(side="left")
         viewport = ttk.Frame(graph, padding=(6, 0, 6, 6))
-        viewport.grid(row=1, column=0, sticky="nsew")
+        viewport.grid(row=2, column=0, sticky="nsew")
         self.graph = tk.Canvas(viewport, width=640, background=self.COLORS["paper"], highlightthickness=0)
         self.scrollable(viewport, self.graph, ttk, horizontal=True)
         self.graph.bind("<Button-1>", self.graph_clicked)
@@ -408,12 +454,12 @@ class Viewer:
                 title = path if len(path) <= 25 else "…" + path[-24:]
                 canvas.create_text((x1 + 10) * scale, (y1 + 15) * scale, anchor="w",
                                    text=title, font=title_font, fill=colors["ink"])
+        ports = edge_ports(self.edges, positions)
         for edge in self.edges:
-            points = edge_path(positions[edge["from_id"]], positions[edge["to_id"]])
+            points = edge_path(positions[edge["from_id"]], positions[edge["to_id"]], ports[edge["id"]])
             inferred = edge["provenance"]["status"] == "INFERRED"
             item = canvas.create_line(
                 *(value * scale for value in points), arrow="last", smooth=True,
-                arrowshape=tuple(max(1, round(value * scale)) for value in (8, 10, 3)),
                 dash=(4, 3) if inferred else (), tags="edges",
             )
             self.edge_items[edge["id"]] = item
@@ -439,22 +485,37 @@ class Viewer:
 
     def highlight_graph(self):
         canvas, colors = self.graph, self.COLORS
-        related = set()
-        for edge in self.edges:
-            endpoints = (edge["from_id"], edge["to_id"])
-            active = self.focus_id in endpoints
-            if active:
-                related.update(endpoints)
-            item = self.edge_items[edge["id"]]
-            color = colors["accent"] if active else colors["muted_line" if self.focus_id else "line"]
-            canvas.itemconfigure(item, fill=color, width=max(1, (3 if active else 1.5) * self.scale))
-            if active:
-                canvas.tag_raise(item, "edges")
+        callers, callees = set(), set()
+        canvas.tag_raise("edges")
         canvas.tag_raise("nodes")
+        for edge in self.edges:
+            origin, target = edge["from_id"], edge["to_id"]
+            incoming, outgoing = target == self.focus_id, origin == self.focus_id
+            if incoming:
+                callers.add(origin)
+            if outgoing:
+                callees.add(target)
+            item = self.edge_items[edge["id"]]
+            if incoming or outgoing:
+                color = colors["both" if incoming and outgoing else "caller" if incoming else "accent"]
+                arrow = tuple(max(minimum, round(size * self.scale))
+                              for minimum, size in ((6, 9), (8, 12), (3, 4)))
+                canvas.itemconfigure(item, fill=color, width=max(2, 3 * self.scale), arrowshape=arrow)
+                canvas.tag_raise(item)
+            else:
+                color = colors["muted_line" if self.focus_id else "line"]
+                arrow = tuple(max(1, round(value * self.scale)) for value in (8, 10, 3))
+                canvas.itemconfigure(item, fill=color, width=max(1, 1.5 * self.scale), arrowshape=arrow)
+        self.callers_label.set(f"Callers · {len(callers)}" if self.focus_id else "Callers")
+        self.callees_label.set(f"Callees · {len(callees)}" if self.focus_id else "Callees")
         for node_id, (box, label) in self.node_items.items():
             if node_id == self.focus_id:
                 fill, border, ink = ("selected", "accent", "white")
-            elif node_id in related:
+            elif node_id in callers and node_id in callees:
+                fill, border, ink = ("both_fill", "both", "ink")
+            elif node_id in callers:
+                fill, border, ink = ("caller_fill", "caller", "ink")
+            elif node_id in callees:
                 fill, border, ink = ("related", "accent", "ink")
             elif self.focus_id:
                 fill, border, ink = ("muted_fill", "muted_line", "muted_ink")
@@ -462,6 +523,9 @@ class Viewer:
                 fill, border, ink = ("white", "border", "ink")
             canvas.itemconfigure(box, fill=colors[fill], outline=colors[border])
             canvas.itemconfigure(label, fill=colors[ink])
+            if node_id == self.focus_id or node_id in callers or node_id in callees:
+                canvas.tag_raise(box)
+                canvas.tag_raise(label)
 
     def graph_clicked(self, _event):
         current = self.graph.find_withtag("current")

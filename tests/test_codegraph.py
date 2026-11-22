@@ -451,9 +451,12 @@ class Conditional:
         self.assertEqual(node_fill(target), viewer.COLORS["related"])
         self.assertEqual(node_fill(unrelated), viewer.COLORS["muted_fill"])
         for edge in graph["edges"]:
-            active = node["id"] in (edge["from_id"], edge["to_id"])
             fill = viewer.graph.itemcget(viewer.edge_items[edge["id"]], "fill")
-            self.assertEqual(fill, viewer.COLORS["accent" if active else "muted_line"])
+            if edge["to_id"] == node["id"]:
+                self.assertEqual(fill, viewer.COLORS["caller"])
+            else:
+                expected = "accent" if edge["from_id"] == node["id"] else "muted_line"
+                self.assertEqual(fill, viewer.COLORS[expected])
         tags = list(map(str, viewer.source.tag_ranges("focus")))
         self.assertEqual(tags, [
             f'{node["source_ref"]["start_line"]}.0', f'{node["source_ref"]["end_line"] + 1}.0',
@@ -474,6 +477,19 @@ class Conditional:
         self.assertEqual(viewer.search_summary.get(), "1 match")
         viewer.open_first_match(None)
         self.assertEqual(node_fill(target), viewer.COLORS["selected"])
+        self.assertEqual(node_fill(node), viewer.COLORS["caller_fill"])
+        self.assertEqual(viewer.callers_label.get(), "Callers · 1")
+        self.assertEqual(viewer.callees_label.get(), "Callees · 1")
+        incoming = next(edge for edge in graph["edges"] if edge["to_id"] == target["id"])
+        outgoing = next(edge for edge in graph["edges"] if edge["from_id"] == target["id"])
+        incoming_item = viewer.edge_items[incoming["id"]]
+        outgoing_item = viewer.edge_items[outgoing["id"]]
+        self.assertEqual(viewer.graph.itemcget(incoming_item, "fill"), viewer.COLORS["caller"])
+        self.assertEqual(viewer.graph.itemcget(outgoing_item, "fill"), viewer.COLORS["accent"])
+        self.assertTrue(viewer.graph.itemcget(incoming_item, "dash"))
+        stacking = list(viewer.graph.find_all())
+        self.assertLess(stacking.index(viewer.node_items[unrelated["id"]][0]), stacking.index(incoming_item))
+        self.assertLess(stacking.index(incoming_item), stacking.index(viewer.node_items[target["id"]][0]))
         self.assertIn("def callback(self):", viewer.source.get(*viewer.source.tag_ranges("focus")))
         viewer.query.set("missing symbol")
         self.assertFalse(viewer.symbols.get_children())
