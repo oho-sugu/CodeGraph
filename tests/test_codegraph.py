@@ -197,6 +197,106 @@ def outer():
         self.assertEqual(outgoing("wrapped.Shadowed.run"), [])
         self.assertEqual(outgoing("wrapped.outer"), [("helper", "VERIFIED")])
 
+    def test_method_receivers_from_local_constructors_and_type_annotations(self):
+        self.write("src/model.py", """\
+class Service:
+    def run(self):
+        pass
+
+def discover() -> 'Service':
+    return Service()
+
+async def async_discover() -> Service:
+    return Service()
+""")
+        self.write("src/consumer.py", """\
+import model
+from model import Service as Client, discover, async_discover
+
+def execute(mode):
+    if mode == 'init':
+        project = init()
+        return project
+    project = discover()
+    match mode:
+        case 'run':
+            project.run()
+
+def from_constructor():
+    client = Client()
+    client.run()
+
+def from_parameter(client: 'model.Service'):
+    client.run()
+
+def overwritten(flag):
+    client = Client()
+    if flag:
+        client = other()
+    client.run()
+
+def modified():
+    client = Client()
+    client.run = other
+    client.run()
+
+def before_assignment():
+    client.run()
+    client = Client()
+
+def async_result():
+    client = async_discover()
+    client.run()
+
+class Viewer:
+    def __init__(self, project: Client):
+        self.project = project
+        self.project.run()
+
+    def refresh(self):
+        self.project.run()
+
+class Reassigns:
+    def __init__(self, project: Client):
+        self.project = project
+
+    def refresh(self):
+        self.project.run()
+
+    def swap(self, project):
+        self.project = project
+
+class Conditional:
+    def __init__(self, project: Client, enabled):
+        if enabled:
+            self.project = project
+
+    def refresh(self):
+        self.project.run()
+""")
+        self.project.analyze()
+        symbols = self.symbols()
+        resolved = ("execute", "from_constructor", "from_parameter", "Viewer.__init__", "Viewer.refresh")
+        for name in resolved:
+            with self.subTest(name=name):
+                refs = self.project.refs(symbols[f"consumer.{name}"]["id"], "outgoing")["outgoing"]
+                service = [ref for ref in refs if ref["node"]["qualified_name"] == "model.Service.run"]
+                self.assertEqual(len(service), 1)
+                self.assertEqual(service[0]["edge"]["provenance"]["status"], "INFERRED")
+                self.assertEqual(service[0]["edge"]["evidence"][0]["path"], "src/consumer.py")
+        unresolved = (
+            ("overwritten", "client.run"), ("modified", "client.run"),
+            ("before_assignment", "client.run"), ("async_result", "client.run"),
+            ("Reassigns.refresh", "self.project.run"), ("Conditional.refresh", "self.project.run"),
+        )
+        for name, expression in unresolved:
+            with self.subTest(name=name):
+                node = symbols[f"consumer.{name}"]["id"]
+                calls = self.project.inspect(node)["unresolved_calls"]
+                self.assertIn(expression, {call["expression"] for call in calls})
+                refs = self.project.refs(node, "outgoing")["outgoing"]
+                self.assertNotIn("model.Service.run", {ref["node"]["qualified_name"] for ref in refs})
+
     def test_deterministic_changes_and_syntax_recovery(self):
         first = self.project.analyze()
         original = self.symbols()

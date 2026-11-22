@@ -74,20 +74,32 @@ class Bindings(ast.NodeVisitor):
         self.counts = Counter()
         self.direct = {}
         self.external = set()
-        self.attributes = set()
+        self.attributes = Counter()
+        self.assignments = {}
+        self.last_write = {}
+        self.parameters = {}
         self.star = False
         if args is not None:
             regular = [*args.posonlyargs, *args.args, *args.kwonlyargs]
             self.counts.update(arg.arg for arg in [*regular, args.vararg, args.kwarg] if arg)
+            self.parameters = {arg.arg: arg.annotation for arg in regular if arg.annotation is not None}
         for param in type_params:
             self.counts[param.name] += 1
-        for statement in body:
+        for self.statement_index, statement in enumerate(body):
             self.visit(statement)
             if isinstance(statement, DECLARATIONS):
                 self.direct[statement.name] = statement
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 for item in statement.names:
                     self.direct[self.import_name(statement, item)] = (statement, item)
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = dotted_name(statement.targets[0])
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                target = dotted_name(statement.target)
+            else:
+                continue
+            if target:
+                self.assignments[target] = (statement, self.statement_index)
 
     @staticmethod
     def import_name(statement, item):
@@ -100,24 +112,30 @@ class Bindings(ast.NodeVisitor):
             return self.direct.get(name)
         return None
 
+    def bind(self, name):
+        self.counts[name] += 1
+        self.last_write[name] = self.statement_index
+
     def visit_Name(self, node):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self.counts[node.id] += 1
+            self.bind(node.id)
 
     def visit_Attribute(self, node):
-        if isinstance(node.ctx, (ast.Store, ast.Del)) and isinstance(node.value, ast.Name):
-            self.attributes.add((node.value.id, node.attr))
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            target = dotted_name(node)
+            if target:
+                self.attributes[target] += 1
         self.generic_visit(node)
 
     def visit_Import(self, node):
         for item in node.names:
-            self.counts[self.import_name(node, item)] += 1
+            self.bind(self.import_name(node, item))
             self.star |= item.name == "*"
 
     visit_ImportFrom = visit_Import
 
     def visit_FunctionDef(self, node):
-        self.counts[node.name] += 1
+        self.bind(node.name)
         defaults = [*node.args.defaults, *(arg for arg in node.args.kw_defaults if arg)]
         for expression in [*node.decorator_list, *defaults]:
             self.visit(expression)
@@ -125,7 +143,7 @@ class Bindings(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_ClassDef(self, node):
-        self.counts[node.name] += 1
+        self.bind(node.name)
         for expression in [*node.decorator_list, *node.bases, *node.keywords]:
             self.visit(expression)
 
@@ -147,19 +165,19 @@ class Bindings(ast.NodeVisitor):
 
     def visit_ExceptHandler(self, node):
         if node.name:
-            self.counts[node.name] += 1
+            self.bind(node.name)
         self.generic_visit(node)
 
     def visit_MatchAs(self, node):
         if node.name:
-            self.counts[node.name] += 1
+            self.bind(node.name)
         self.generic_visit(node)
 
     visit_MatchStar = visit_MatchAs
 
     def visit_MatchMapping(self, node):
         if node.rest:
-            self.counts[node.rest] += 1
+            self.bind(node.rest)
         self.generic_visit(node)
 
 
@@ -333,7 +351,7 @@ class Resolver:
         base = package[:len(package) + 1 - statement.level]
         return ".".join([*base, *([statement.module] if statement.module else [])])
 
-    def imported_function(self, file, binding, tail):
+    def imported_declaration(self, file, binding, tail):
         statement, item = binding
         if isinstance(statement, ast.Import):
             prefix = () if item.asname else tuple(item.name.split(".")[1:])
@@ -351,14 +369,55 @@ class Resolver:
                 return None
         module = self.module(module_name)
         if module:
-            return self.function(module, module.root.bindings.unique(name))
+            syntax = module.root.bindings.unique(name)
+            if isinstance(syntax, DECLARATIONS):
+                return module, syntax
         return None
 
     @staticmethod
-    def function(file, syntax):
-        if isinstance(syntax, FUNCTIONS) and not syntax.decorator_list:
-            return file.scopes[syntax].node
+    def before(statement, expression):
+        return (statement.end_lineno, statement.end_col_offset) <= (expression.lineno, expression.col_offset)
+
+    def declaration(self, file, binding, tail):
+        if isinstance(binding, tuple):
+            return self.imported_declaration(file, binding, tail)
+        if not tail and isinstance(binding, DECLARATIONS):
+            return file, binding
         return None
+
+    @staticmethod
+    def attribute_written(parts, *scopes):
+        return any(scope.attributes[parts[:length]] for scope in scopes for length in range(2, len(parts) + 1))
+
+    def lookup(self, file, scope, parts, site):
+        name, *rest = parts
+        tail = tuple(rest)
+        local = scope.bindings
+        if name in local.external:
+            return None, "explicit_outer_binding"
+        if local.counts[name] or local.star:
+            binding = local.unique(name)
+            if binding:
+                statement = binding[0] if isinstance(binding, tuple) else binding
+                if self.before(statement, site):
+                    if self.attribute_written(parts, local):
+                        return None, "shadowed_attribute"
+                    result = self.declaration(file, binding, tail)
+                    if result:
+                        return result, "VERIFIED"
+            return None, "local_binding"
+        outer = scope.parent
+        while outer is not file.root:
+            if isinstance(outer.syntax, FUNCTIONS) and (
+                outer.bindings.counts[name] or name in outer.bindings.external
+            ):
+                return None, "closure_binding"
+            outer = outer.parent
+        module = file.root.bindings
+        if self.attribute_written(parts, module, local):
+            return None, "unresolved_name"
+        result = self.declaration(file, module.unique(name), tail)
+        return (result, "VERIFIED") if result else (None, "unresolved_name")
 
     def method_wrapper(self, file, owner, syntax):
         if not syntax.decorator_list:
@@ -386,61 +445,144 @@ class Resolver:
                 return "contextmanager"
         return None
 
+    def self_owner(self, file, scope):
+        if scope.node["type"] != "Method":
+            return None
+        owner = scope.parent
+        args = [*scope.syntax.args.posonlyargs, *scope.syntax.args.args]
+        if (
+            args and args[0].arg == "self" and scope.bindings.counts["self"] == 1
+            and "self" not in scope.bindings.external and not owner.syntax.decorator_list
+            and self.method_wrapper(file, owner, scope.syntax) in ("plain", "contextmanager")
+        ):
+            return owner
+        return None
+
+    @staticmethod
+    def methods(file, owner):
+        return [scope for scope in file.scopes.values()
+                if scope.parent is owner and isinstance(scope.syntax, FUNCTIONS)]
+
+    def instance_method(self, file, owner, attribute):
+        target = owner.bindings.unique(attribute)
+        if isinstance(target, FUNCTIONS) and self.method_wrapper(file, owner, target):
+            if not any(sibling.bindings.attributes["self", attribute] for sibling in self.methods(file, owner)):
+                return file.scopes[target].node
+        return None
+
+    def annotation_type(self, file, scope, annotation):
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except (SyntaxError, ValueError):
+                return None
+        parts = dotted_name(annotation)
+        if not parts or any(param.name == parts[0] for param in scope.syntax.type_params):
+            return None
+        name, *tail = parts
+        enclosing = scope.parent
+        while enclosing is not file.root:
+            if enclosing.bindings.counts[name] or name in enclosing.bindings.external:
+                return None
+            enclosing = enclosing.parent
+        module = file.root.bindings
+        if self.attribute_written(parts, module):
+            return None
+        declaration = self.declaration(file, module.unique(name), tuple(tail))
+        if declaration and isinstance(declaration[1], ast.ClassDef):
+            return declaration
+        return None
+
+    def value_type(self, file, scope, value):
+        if isinstance(value, ast.Name):
+            return self.parameter_type(file, scope, value.id)
+        if isinstance(value, ast.Call) and (parts := dotted_name(value.func)):
+            declaration, _ = self.lookup(file, scope, parts, value)
+            if declaration:
+                target_file, syntax = declaration
+                if isinstance(syntax, ast.ClassDef):
+                    return declaration
+                if isinstance(syntax, ast.FunctionDef) and not syntax.decorator_list:
+                    return self.annotation_type(target_file, target_file.scopes[syntax], syntax.returns)
+        return None
+
+    def parameter_type(self, file, scope, name):
+        local = scope.bindings
+        if local.counts[name] == 1 and name not in local.external and name in local.parameters:
+            return self.annotation_type(file, scope, local.parameters[name])
+        return None
+
+    def local_type(self, file, scope, name, site):
+        local = scope.bindings
+        assignment = local.assignments.get((name,))
+        if assignment and name not in local.external:
+            statement, index = assignment
+            if local.last_write[name] == index and self.before(statement, site):
+                return self.value_type(file, scope, statement.value)
+        return self.parameter_type(file, scope, name)
+
+    @staticmethod
+    def plain_instance(owner):
+        syntax = owner.syntax
+        hooks = ("__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__")
+        return (
+            not (syntax.bases or syntax.keywords or syntax.decorator_list)
+            and not any(owner.bindings.counts[name] for name in hooks)
+        )
+
+    def field_type(self, file, scope, parts, call):
+        owner = self.self_owner(file, scope)
+        if not owner or not self.plain_instance(owner) or owner.bindings.counts[parts[1]]:
+            return None
+        constructor = owner.bindings.unique("__init__")
+        if not isinstance(constructor, ast.FunctionDef):
+            return None
+        initializer = file.scopes[constructor]
+        assignment = initializer.bindings.assignments.get(parts[:2])
+        if not assignment or self.self_owner(file, initializer) is None:
+            return None
+        siblings = self.methods(file, owner)
+        if (
+            sum(method.bindings.attributes[parts[:2]] for method in siblings) != 1
+            or any(method.bindings.attributes[parts] for method in siblings)
+        ):
+            return None
+        statement, _ = assignment
+        if scope is initializer and not self.before(statement, call):
+            return None
+        return self.value_type(file, initializer, statement.value)
+
+    def inferred_method(self, file, scope, parts, call):
+        if len(parts) == 2 and not self.attribute_written(parts, scope.bindings):
+            receiver = self.local_type(file, scope, parts[0], call)
+        elif len(parts) == 3 and parts[0] == "self":
+            receiver = self.field_type(file, scope, parts, call)
+        else:
+            receiver = None
+        if receiver:
+            target_file, syntax = receiver
+            owner = target_file.scopes[syntax]
+            if self.plain_instance(owner):
+                return self.instance_method(target_file, owner, parts[-1])
+        return None
+
     def target(self, file, scope, call):
         parts = dotted_name(call.func)
         if not parts:
             return None, "dynamic_expression"
-        name, *tail_list = parts
-        tail = tuple(tail_list)
-        local = scope.bindings
-        if name in local.external:
-            return None, "explicit_outer_binding"
-        if name == "self" and len(tail) == 1 and scope.node["type"] == "Method":
-            owner = scope.parent
-            args = [*scope.syntax.args.posonlyargs, *scope.syntax.args.args]
-            attribute = tail[0]
-            if (
-                args and args[0].arg == "self" and local.counts["self"] == 1
-                and not owner.syntax.decorator_list
-                and self.method_wrapper(file, owner, scope.syntax) in ("plain", "contextmanager")
-                and not any(
-                    ("self", attribute) in sibling.bindings.attributes
-                    for sibling in file.scopes.values() if sibling.parent is owner
-                )
-            ):
-                target = owner.bindings.unique(attribute)
-                if isinstance(target, FUNCTIONS) and self.method_wrapper(file, owner, target):
-                    return file.scopes[target].node, "INFERRED"
-            return None, "ambiguous_method"
-        if local.counts[name] or local.star:
-            binding = local.unique(name)
-            if not tail and isinstance(binding, FUNCTIONS) and binding.end_lineno < call.lineno:
-                target = self.function(file, binding)
-                if target:
-                    return target, "VERIFIED"
-            if isinstance(binding, tuple) and binding[0].end_lineno < call.lineno:
-                if tail and (name, tail[0]) in local.attributes:
-                    return None, "shadowed_attribute"
-                target = self.imported_function(file, binding, tail)
-                if target:
-                    return target, "VERIFIED"
-            return None, "local_binding"
-        outer = scope.parent
-        while outer is not file.root:
-            if isinstance(outer.syntax, FUNCTIONS) and (
-                outer.bindings.counts[name] or name in outer.bindings.external
-            ):
-                return None, "closure_binding"
-            outer = outer.parent
-        module = file.root.bindings
-        binding = module.unique(name)
-        if isinstance(binding, tuple) and not (
-            tail and ((name, tail[0]) in module.attributes or (name, tail[0]) in local.attributes)
-        ):
-            target = self.imported_function(file, binding, tail)
-        else:
-            target = self.function(file, binding) if not tail else None
-        return (target, "VERIFIED") if target else (None, "unresolved_name")
+        if len(parts) == 2 and parts[0] == "self" and scope.node["type"] == "Method":
+            owner = self.self_owner(file, scope)
+            target = self.instance_method(file, owner, parts[-1]) if owner else None
+            return (target, "INFERRED") if target else (None, "ambiguous_method")
+        declaration, status = self.lookup(file, scope, parts, call)
+        if declaration:
+            target_file, syntax = declaration
+            if isinstance(syntax, FUNCTIONS) and not syntax.decorator_list:
+                return target_file.scopes[syntax].node, "VERIFIED"
+            status = "unresolved_name"
+        if target := self.inferred_method(file, scope, parts, call):
+            return target, "INFERRED"
+        return None, status
 
     def imports(self, file, statement):
         if isinstance(statement, ast.Import):

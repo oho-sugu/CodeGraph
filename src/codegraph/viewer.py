@@ -4,7 +4,7 @@ import sqlite3
 from collections import defaultdict
 from math import ceil
 
-from .core import CodeGraphError
+from .core import CodeGraphError, Project
 
 
 NODE_WIDTH = 154
@@ -59,7 +59,7 @@ def edge_path(origin, destination):
     return start, y1, bend, y1, bend, y2, end, y2
 
 
-def open_viewer(project):
+def open_viewer(project: Project):
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -81,7 +81,7 @@ class Viewer:
         "muted_fill": "#f3f5f9", "muted_ink": "#6e7c92", "muted_line": "#ccd5e3",
     }
 
-    def __init__(self, root, project, tk, ttk):
+    def __init__(self, root, project: Project, tk, ttk):
         self.project = project
         self.tk = tk
         self.root = root

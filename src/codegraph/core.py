@@ -112,7 +112,7 @@ def migrate(db):
         db.execute(f"PRAGMA user_version = {target}")
 
 
-def init(root, source_root=None):
+def init(root, source_root=None) -> Project:
     root = Path(root).resolve()
     home = root / ".codegraph"
     requested = source_directory(root, source_root) if source_root is not None else None
@@ -150,7 +150,7 @@ def init(root, source_root=None):
     return Project(root)
 
 
-def discover(start=None):
+def discover(start=None) -> Project:
     if start is not None:
         return Project(Path(start).resolve())
     cwd = Path.cwd()

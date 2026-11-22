@@ -37,6 +37,8 @@ uv run --locked cg --project $project inspect --annotations --format json
 
 ソース座標は行・列ともに 1 始まりで、範囲の終点はその文字を含みません。`analyze` の JSON にはファイル別診断が含まれ、構文エラーのあるファイルの前回のシンボルには `stale` が付きます。解決できなかった呼び出しは `inspect` の `unresolved_calls` に、同一クラスの `self.method()` は `INFERRED` の参照に現れます。
 
+プロジェクト内の単純なクラスについては、コンストラクター、戻り値の型注釈、引数の型注釈からローカル変数や `self` の属性の型を追います。これらのレシーバー経由の呼び出しも `INFERRED` になります。
+
 `.codegraph/annotations/annotations.jsonl` に注釈の正本を保存します。注釈対象の変更や削除は、再解析後に `NEEDS_REVIEW` または `ORPHANED` として確認できます。`graph.db` を再構築するときは `cg analyze` を実行します。
 
 ### Viewer の起動確認
