@@ -8,19 +8,14 @@ from collections import defaultdict
 from math import ceil
 
 from .core import CodeGraphError, Project
+from .hierarchy import hierarchy_layout
+from .viewer_theme import DARK, LIGHT, SOURCE_TAGS, style_widgets
 
 
 NODE_WIDTH = 154
 NODE_HEIGHT = 30
 COLUMN_STEP = 180
 ROW_STEP = 43
-SOURCE_COLORS = {
-    "line_number": "#536782",
-    "keyword": "#6231a1",
-    "string": "#166044",
-    "comment": "#526577",
-    "number": "#93441a",
-}
 TOKEN_STYLES = {
     tokenize.STRING: "string",
     tokenize.FSTRING_START: "string",
@@ -144,19 +139,15 @@ def open_viewer(project: Project):
 
 
 class Viewer:
-    COLORS = {
-        "paper": "#f4f6fa", "white": "#ffffff", "ink": "#19253a",
-        "selected": "#254c93", "related": "#dce9ff", "accent": "#254c93",
-        "line": "#8798b3", "border": "#92a3bd", "group": "#edf1f7",
-        "muted_fill": "#f3f5f9", "muted_ink": "#6e7c92", "muted_line": "#ccd5e3",
-        "caller": "#97501e", "caller_fill": "#fff0dc",
-        "both": "#694499", "both_fill": "#eee2fc",
-    }
-
     def __init__(self, root, project: Project, tk, ttk):
+        from tkinter.font import nametofont
+
         self.project = project
         self.tk = tk
         self.root = root
+        self.COLORS = DARK
+        self.style = ttk.Style(root)
+        self.style.theme_use("clam")
         root.title(f"CodeGraph · {project.root.name}")
         root.geometry("1280x740")
         root.minsize(740, 440)
@@ -167,17 +158,31 @@ class Viewer:
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text=str(project.root)).pack(side="left")
         ttk.Button(header, text="Refresh graph", command=self.refresh).pack(side="right")
+        self.dark_mode = tk.BooleanVar(value=True)
+        ttk.Checkbutton(header, text="Dark", variable=self.dark_mode, command=self.apply_theme).pack(
+            side="right", padx=8
+        )
         self.graph_summary = tk.StringVar()
         ttk.Label(header, textvariable=self.graph_summary).pack(side="right", padx=10)
 
         panes = ttk.Panedwindow(main, orient="horizontal")
         panes.pack(fill="both", expand=True)
-        symbols = ttk.Labelframe(panes, text="Functions and methods", padding=6)
+        sidebar = ttk.Notebook(panes)
+        symbols = ttk.Frame(sidebar, padding=6)
+        files = ttk.Frame(sidebar, padding=6)
+        sidebar.add(symbols, text="Symbols")
+        sidebar.add(files, text="Files")
+        self.sidebar = sidebar
+        self.files_tab = files
         graph = ttk.Labelframe(panes, text="Call graph")
-        source = ttk.Labelframe(panes, text="Source", padding=6)
-        panes.add(symbols, weight=1)
+        details = ttk.Panedwindow(panes, orient="vertical")
+        source = ttk.Labelframe(details, text="Source", padding=6)
+        notes = ttk.Labelframe(details, text="Notes", padding=6)
+        details.add(source, weight=4)
+        details.add(notes, weight=1)
+        panes.add(sidebar, weight=1)
         panes.add(graph, weight=5)
-        panes.add(source, weight=2)
+        panes.add(details, weight=2)
 
         symbols.columnconfigure(0, weight=1)
         symbols.rowconfigure(2, weight=1)
@@ -197,6 +202,23 @@ class Viewer:
         self.scrollable(results, self.symbols, ttk, horizontal=True)
         self.symbols.bind("<<TreeviewSelect>>", self.selection_changed)
 
+        files.columnconfigure(0, weight=1)
+        files.rowconfigure(2, weight=1)
+        self.file_query = tk.StringVar()
+        ttk.Label(files, text="Search files").grid(row=0, column=0, sticky="w")
+        self.file_search = ttk.Entry(files, textvariable=self.file_query)
+        self.file_search.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        self.file_search.bind("<Return>", self.open_first_file)
+        self.file_search.bind("<Escape>", lambda event: self.clear_search(event, self.file_query))
+        file_results = ttk.Frame(files)
+        file_results.grid(row=2, column=0, sticky="nsew")
+        self.file_tree = ttk.Treeview(file_results, show="tree", selectmode="browse")
+        self.file_tree.column("#0", width=225, minwidth=135)
+        self.scrollable(file_results, self.file_tree, ttk, horizontal=True)
+        self.file_tree.bind("<<TreeviewSelect>>", self.file_selection_changed)
+        self.file_summary = tk.StringVar()
+        ttk.Label(files, textvariable=self.file_summary).grid(row=3, column=0, sticky="w")
+
         graph.columnconfigure(0, weight=1)
         graph.rowconfigure(2, weight=1)
         toolbar = ttk.Frame(graph, padding=(6, 4))
@@ -205,47 +227,103 @@ class Viewer:
             ("Fit", self.fit_graph), ("−", lambda: self.zoom(0.8)),
             ("+", lambda: self.zoom(1.25)), ("Clear focus", self.clear_focus),
         ):
-            ttk.Button(toolbar, text=label, command=action).pack(side="left", padx=(0, 4))
+            width = 10 if label == "Clear focus" else 4
+            ttk.Button(toolbar, text=label, command=action, width=width).pack(side="left", padx=(0, 4))
+        self.layout_mode = tk.StringVar(value="Hierarchy")
+        for mode in ("Hierarchy", "By file"):
+            ttk.Radiobutton(toolbar, text=mode, value=mode, variable=self.layout_mode,
+                            command=self.change_layout).pack(side="left", padx=(4, 0))
+        self.io_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="I/O", variable=self.io_enabled, command=self.change_layout).pack(
+            side="left", padx=(6, 0)
+        )
         legend = ttk.Frame(graph, padding=(7, 0, 7, 5))
         legend.grid(row=1, column=0, sticky="ew")
         self.callers_label = tk.StringVar()
         self.callees_label = tk.StringVar()
-        ttk.Label(legend, textvariable=self.callers_label, foreground=self.COLORS["caller"]).pack(
-            side="left", padx=(0, 12)
-        )
-        ttk.Label(legend, textvariable=self.callees_label, foreground=self.COLORS["accent"]).pack(side="left")
+        self.callers_legend = ttk.Label(legend, textvariable=self.callers_label)
+        self.callers_legend.pack(side="left", padx=(0, 12))
+        self.callees_legend = ttk.Label(legend, textvariable=self.callees_label)
+        self.callees_legend.pack(side="left")
+        self.io_summary = tk.StringVar()
+        ttk.Label(legend, textvariable=self.io_summary).pack(side="left", padx=(12, 0))
         viewport = ttk.Frame(graph, padding=(6, 0, 6, 6))
         viewport.grid(row=2, column=0, sticky="nsew")
-        self.graph = tk.Canvas(viewport, width=640, background=self.COLORS["paper"], highlightthickness=0)
+        self.graph = tk.Canvas(viewport, width=640, background=self.COLORS["paper"], highlightthickness=0,
+                               takefocus=True)
         self.scrollable(viewport, self.graph, ttk, horizontal=True)
-        self.graph.bind("<Button-1>", self.graph_clicked)
+        self.graph.bind("<ButtonPress-1>", self.start_graph_drag)
+        self.graph.bind("<B1-Motion>", self.drag_graph)
+        self.graph.bind("<ButtonRelease-1>", self.end_graph_drag)
         self.graph.bind("<Button-2>", lambda event: self.graph.scan_mark(event.x, event.y))
         self.graph.bind("<B2-Motion>", lambda event: self.graph.scan_dragto(event.x, event.y, gain=1))
+        self.bind_graph_navigation()
         self.graph.bind("<Configure>", self.resize_graph)
         root.bind("<Escape>", lambda _event: self.clear_focus())
         self.nodes = []
         self.edges = []
+        self.files = []
+        self.visible_files = []
         self.layout = ([], {}, (0, 0))
         self.scale = 1.0
         self.fitting = True
         self.focus_id = None
+        self.focus_path = None
+        self.focus_resource = None
         self.graph_nodes = {}
         self.node_items = {}
         self.edge_items = {}
+        self.io_items = {}
+        self.resource_items = {}
+        self.resources = {}
+        self.io = {"resources": [], "edges": [], "unresolved": [], "documents": []}
+        self.note_markers = {}
+        self.notes_by_node = {}
+        self.notes_error = None
+        self.note_target = None
+        self.drag_origin = None
+        self.dragging = False
 
         self.source = tk.Text(
             source, font="TkFixedFont", width=42, wrap="none", state="disabled",
             relief="flat", padx=8, pady=8, background=self.COLORS["paper"],
             foreground=self.COLORS["ink"],
         )
-        self.source.tag_configure("focus", background=self.COLORS["related"])
-        for tag, color in SOURCE_COLORS.items():
-            self.source.tag_configure(tag, foreground=color)
+        self.keyword_font = nametofont("TkFixedFont", root=root).copy()
+        self.keyword_font.configure(weight="bold")
+        self.source.tag_configure("keyword", font=self.keyword_font)
         self.scrollable(source, self.source, ttk, horizontal=True)
+        notes.columnconfigure(0, weight=1)
+        notes.rowconfigure(1, weight=1)
+        self.add_note_button = ttk.Button(notes, text="Add note", command=self.add_note, state="disabled")
+        self.add_note_button.grid(row=0, column=0, sticky="e", pady=(0, 4))
+        note_list = ttk.Frame(notes)
+        note_list.grid(row=1, column=0, sticky="nsew")
+        self.note_text = tk.Text(note_list, height=4, width=25, wrap="word", state="disabled",
+                                 relief="flat", padx=8, pady=6)
+        self.scrollable(note_list, self.note_text, ttk)
         self.status = tk.StringVar()
         ttk.Label(main, textvariable=self.status).pack(fill="x", pady=(8, 0))
         self.query.trace_add("write", self.update_symbol_list)
+        self.file_query.trace_add("write", self.update_file_list)
+        self.apply_theme()
         self.refresh()
+
+    def apply_theme(self):
+        self.COLORS = colors = DARK if self.dark_mode.get() else LIGHT
+        style_widgets(self.style, colors)
+        self.root.configure(background=colors["chrome"])
+        self.graph.configure(background=colors["paper"])
+        self.source.configure(background=colors["paper"], foreground=colors["ink"],
+                              selectbackground=colors["selected"], selectforeground=colors["selected_ink"])
+        self.note_text.configure(background=colors["paper"], foreground=colors["ink"],
+                                 selectbackground=colors["selected"], selectforeground=colors["selected_ink"])
+        self.source.tag_configure("focus", background=colors["source_focus"])
+        for tag in SOURCE_TAGS:
+            self.source.tag_configure(tag, foreground=colors[tag])
+        self.callers_legend.configure(foreground=colors["caller"])
+        self.callees_legend.configure(foreground=colors["accent"])
+        self.draw_graph()
 
     @staticmethod
     def scrollable(parent, widget, ttk, *, horizontal=False):
@@ -266,17 +344,54 @@ class Viewer:
         except (CodeGraphError, OSError, sqlite3.Error) as error:
             self.status.set(str(error))
             return
-        self.nodes, self.edges = data["nodes"], data["edges"]
-        self.layout = layout_graph(self.nodes)
+        self.nodes, self.edges, self.files = data["nodes"], data["edges"], data["files"]
+        self.io = data["io"]
+        self.resources = {resource["id"]: resource for resource in self.io["resources"]}
+        if self.focus_resource not in self.resources:
+            self.focus_resource = None
+        self.load_notes()
+        self.update_layout()
         self.graph_summary.set(f"{len(self.nodes)} symbols · {len(self.edges)} calls")
         if self.focus_id not in self.layout[1]:
             self.focus_id = None
+        if self.focus_path not in self.files:
+            self.focus_path = None
         self.update_symbol_list()
+        self.update_file_list()
         if self.fitting:
             self.fit_graph()
         else:
             self.draw_graph()
         self.render_selection()
+
+    def update_layout(self):
+        if self.layout_mode.get() == "Hierarchy":
+            self.layout = hierarchy_layout(self.nodes, self.edges, NODE_WIDTH, NODE_HEIGHT)
+        else:
+            self.layout = layout_graph(self.nodes)
+        if self.io_enabled.get() and self.resources:
+            groups, positions, (width, height) = self.layout
+            lanes = (
+                ("Tables", [item for item in self.resources.values() if item["kind"] == "table"]),
+                ("Files and handles", [item for item in self.resources.values() if item["kind"] != "table"]),
+            )
+            for title, members in lanes:
+                if not members:
+                    continue
+                left = width + 45
+                bottom = 72 + len(members) * ROW_STEP
+                groups.append((title, left, 18, left + NODE_WIDTH + 30, bottom))
+                for row, item in enumerate(members):
+                    positions[item["id"]] = (left + NODE_WIDTH / 2 + 15, 66 + row * ROW_STEP)
+                width, height = left + NODE_WIDTH + 54, max(height, bottom + 18)
+            self.layout = groups, positions, (width, height)
+
+    def change_layout(self):
+        if not self.io_enabled.get() and self.focus_resource:
+            self.focus_resource = None
+            self.render_selection()
+        self.update_layout()
+        self.fit_graph()
 
     def update_symbol_list(self, *_trace):
         query = self.query.get().strip().casefold()
@@ -305,13 +420,16 @@ class Viewer:
             self.symbols.see(self.focus_id)
 
     def focus_search(self, _event):
-        self.search.focus_set()
-        self.search.selection_range(0, "end")
+        field = self.file_search if self.sidebar.select() == str(self.files_tab) else self.search
+        field.focus_set()
+        field.selection_range(0, "end")
         return "break"
 
-    def clear_search(self, _event):
-        if self.query.get():
-            self.query.set("")
+    def clear_search(self, _event, query=None):
+        if query is None:
+            query = self.query
+        if query.get():
+            query.set("")
             return "break"
         return None
 
@@ -323,7 +441,10 @@ class Viewer:
 
     def clear_focus(self):
         self.focus_id = None
+        self.focus_path = None
+        self.focus_resource = None
         self.symbols.selection_remove(*self.symbols.selection())
+        self.file_tree.selection_remove(*self.file_tree.selection())
         self.render_selection()
 
     def selection_changed(self, _event):
@@ -333,6 +454,9 @@ class Viewer:
 
     def select_symbol(self, node_id):
         self.focus_id = node_id
+        self.focus_path = None
+        self.focus_resource = None
+        self.file_tree.selection_remove(*self.file_tree.selection())
         if self.symbols.exists(node_id):
             if self.symbols.selection() != (node_id,):
                 self.symbols.selection_set(node_id)
@@ -342,25 +466,162 @@ class Viewer:
         self.reveal_node(node_id)
         self.render_selection()
 
+    def update_file_list(self, *_trace):
+        query = self.file_query.get().strip().replace("\\", "/").casefold()
+        matches = [path for path in self.files if query in path.casefold()]
+        self.visible_files = sorted(matches, key=lambda path: (
+            query not in (path.casefold(), path.rsplit("/", 1)[-1].casefold()), path
+        ))
+        summary = ""
+        if query:
+            if matches:
+                noun = "file" if len(matches) == 1 else "files"
+                summary = f"{len(matches)} matching {noun}"
+            else:
+                summary = "No matching files"
+        self.file_summary.set(summary)
+        tree = self.file_tree
+        tree.delete(*tree.get_children())
+        folders = {}
+        for path in matches:
+            parts = path.split("/")
+            parent = ""
+            for index, part in enumerate(parts[:-1], 1):
+                folder = "/".join(parts[:index])
+                if folder not in folders:
+                    folders[folder] = tree.insert(parent, "end", text=part, open=True)
+                parent = folders[folder]
+        for path in matches:
+            folder, _, name = path.rpartition("/")
+            tree.insert(folders.get(folder, ""), "end", iid=path, text=name)
+        if self.focus_path and tree.exists(self.focus_path):
+            tree.selection_set(self.focus_path)
+            tree.see(self.focus_path)
+
+    def open_first_file(self, _event):
+        if self.visible_files:
+            self.select_file(self.visible_files[0])
+        return "break"
+
+    def file_selection_changed(self, _event):
+        selection = self.file_tree.selection()
+        if selection and selection[0] in self.visible_files and selection[0] != self.focus_path:
+            self.select_file(selection[0])
+
+    def select_file(self, path):
+        self.focus_path, self.focus_id = path, None
+        self.focus_resource = None
+        self.symbols.selection_remove(*self.symbols.selection())
+        if self.file_tree.selection() != (path,):
+            self.file_tree.selection_set(path)
+        self.file_tree.see(path)
+        self.render_selection()
+        members = [node["id"] for node in self.nodes if node["source_ref"]["path"] == path]
+        if members:
+            self.reveal_node(members[0])
+
     def render_selection(self):
         self.highlight_graph()
-        if not self.focus_id:
+        self.render_notes()
+        if self.focus_resource:
+            self.render_resource()
+            return
+        if not (self.focus_id or self.focus_path):
             self.show_source("", None)
             self.status.set("Select a function or method to see its calls and source." if self.nodes
                             else "Run cg analyze to add Python functions and methods.")
             return
         try:
-            data = self.project.source(self.focus_id)
+            if self.focus_path:
+                data = self.project.file_source(self.focus_path)
+            else:
+                data = self.project.source(self.focus_id)
         except (CodeGraphError, OSError, sqlite3.Error) as error:
             self.show_source("", None)
             self.status.set(str(error))
             return
-        node = data["node"]
-        ref = node["source_ref"]
+        ref = None
+        if self.focus_path:
+            location = self.focus_path
+        else:
+            node = data["node"]
+            ref = node["source_ref"]
+            location = f'{node["qualified_name"]} · {ref["path"]}:{ref["start_line"]}'
         current = data["source_current"]
+        if self.focus_id and current and not self.notes_error:
+            self.note_target = data["node"]
+            self.add_note_button.state(["!disabled"])
         self.show_source(data["source"] or "", ref if current else None)
-        location = f'{node["qualified_name"]} · {ref["path"]}:{ref["start_line"]}'
         self.status.set(location if current else f"{location} · Source changed. Run cg analyze and refresh.")
+
+    def select_resource(self, resource_id):
+        self.focus_resource, self.focus_id, self.focus_path = resource_id, None, None
+        self.symbols.selection_remove(*self.symbols.selection())
+        self.file_tree.selection_remove(*self.file_tree.selection())
+        self.reveal_node(resource_id)
+        self.render_selection()
+
+    def render_resource(self):
+        resource = self.resources[self.focus_resource]
+        names = {node["id"]: node["qualified_name"] for node in self.nodes}
+        lines = [resource["name"], ""]
+        for definition in resource["definitions"]:
+            lines.append(f'Definition  {definition["path"]}:{definition["line"]}')
+        for edge in self.io["edges"]:
+            if edge["to_id"] != self.focus_resource:
+                continue
+            lines.append(f'{edge["type"]}  {names[edge["from_id"]]}')
+            lines.extend(f'  {ref["path"]}:{ref["line"]}' for ref in edge["evidence"])
+        self.source.configure(state="normal")
+        self.source.delete("1.0", "end")
+        self.source.insert("1.0", "\n".join(lines))
+        self.source.configure(state="disabled")
+        self.status.set(resource["name"])
+
+    def load_notes(self):
+        notes = defaultdict(list)
+        self.notes_error = None
+        try:
+            for note in self.project.annotations():
+                notes[note["target_node_id"]].append(note)
+        except (CodeGraphError, OSError, sqlite3.Error) as error:
+            self.notes_error = str(error)
+        self.notes_by_node = notes
+
+    def render_notes(self):
+        self.note_target = None
+        self.add_note_button.state(["disabled"])
+        if self.notes_error:
+            text = self.notes_error
+        elif self.focus_id:
+            notes = self.notes_by_node.get(self.focus_id, ())
+            text = "\n\n".join(
+                f'{note["type"]} · {note["status"]}\n{note["text"]}'
+                for note in sorted(notes, key=lambda item: (item["created_at"], item["id"]))
+            ) or "No notes yet."
+        else:
+            text = "Select a function or method to view its notes."
+        self.note_text.configure(state="normal")
+        self.note_text.delete("1.0", "end")
+        self.note_text.insert("1.0", text)
+        self.note_text.configure(state="disabled")
+
+    def add_note(self):
+        from .note_editor import open_note_editor
+
+        if self.note_target:
+            node = self.note_target
+            open_note_editor(self.root, self.COLORS, node["qualified_name"],
+                             lambda body: self.save_note(node["id"], body))
+
+    def save_note(self, node_id, body):
+        try:
+            self.project.annotate(node_id, "NOTE", body)
+        except (OSError, sqlite3.Error) as error:
+            raise CodeGraphError(f"Cannot save note: {error}") from error
+        self.load_notes()
+        self.draw_graph()
+        self.render_selection()
 
     def show_source(self, source, ref):
         self.source.configure(state="normal")
@@ -407,11 +668,59 @@ class Viewer:
         self.graph.xview_moveto(0)
         self.graph.yview_moveto(0)
 
-    def zoom(self, factor):
+    def bind_graph_navigation(self):
+        graph = self.graph
+        for event, axis in (("<MouseWheel>", "y"), ("<Shift-MouseWheel>", "x"),
+                            ("<Control-MouseWheel>", "zoom")):
+            graph.bind(event, lambda event, axis=axis: self.graph_wheel(event, axis))
+        for key, dx, dy in (("Left", -48, 0), ("Right", 48, 0), ("Up", 0, -48), ("Down", 0, 48)):
+            graph.bind(f"<{key}>", lambda _event, dx=dx, dy=dy: self.pan_by(dx, dy))
+        for key, factor in (("plus", 1.25), ("equal", 1.25), ("minus", 0.8)):
+            graph.bind(f"<{key}>", lambda _event, factor=factor: self.zoom(factor))
+
+    def graph_wheel(self, event, axis):
+        steps = max(-5, min(5, event.delta / 120))
+        if axis == "zoom":
+            self.zoom(1.25 ** steps, (event.x, event.y))
+        elif axis == "x":
+            self.pan_by(-48 * steps, 0)
+        else:
+            self.pan_by(0, -48 * steps)
+        return "break"
+
+    def pan_by(self, dx, dy):
+        if self.nodes:
+            canvas = self.graph
+            width, height = self.layout[2]
+            if dx:
+                canvas.xview_moveto((canvas.canvasx(0) + dx) / (width * self.scale))
+            if dy:
+                canvas.yview_moveto((canvas.canvasy(0) + dy) / (height * self.scale))
+        return "break"
+
+    def start_graph_drag(self, event):
+        self.graph.focus_set()
+        self.drag_origin = event.x, event.y
+        self.dragging = False
+        self.graph.scan_mark(event.x, event.y)
+
+    def drag_graph(self, event):
+        if self.drag_origin:
+            x, y = self.drag_origin
+            if self.dragging or max(abs(event.x - x), abs(event.y - y)) >= 4:
+                self.dragging = True
+                self.graph.scan_dragto(event.x, event.y, gain=1)
+
+    def end_graph_drag(self, event):
+        if self.drag_origin and not self.dragging:
+            self.graph_clicked(event)
+        self.drag_origin = None
+
+    def zoom(self, factor, anchor=None):
         if not self.nodes:
             return
         canvas = self.graph
-        screen_x, screen_y = canvas.winfo_width() / 2, canvas.winfo_height() / 2
+        screen_x, screen_y = anchor or (canvas.winfo_width() / 2, canvas.winfo_height() / 2)
         center_x = canvas.canvasx(screen_x) / self.scale
         center_y = canvas.canvasy(screen_y) / self.scale
         lower = self.fit_scale()
@@ -426,8 +735,9 @@ class Viewer:
         canvas = self.graph
         if canvas.winfo_width() <= 1 or canvas.winfo_height() <= 1:
             return
-        box, _ = self.node_items[node_id]
-        left, top, right, bottom = canvas.coords(box)
+        items = self.node_items if node_id in self.node_items else self.resource_items
+        box, _ = items[node_id]
+        left, top, right, bottom = canvas.bbox(box)
         width, height = self.layout[2]
         for start, end, origin, visible, extent, move in (
             (left, right, canvas.canvasx(0), canvas.winfo_width(), width, canvas.xview_moveto),
@@ -444,6 +754,9 @@ class Viewer:
         self.graph_nodes.clear()
         self.node_items.clear()
         self.edge_items.clear()
+        self.note_markers.clear()
+        self.resource_items.clear()
+        self.io_items.clear()
         canvas.configure(scrollregion=(0, 0, width * scale, height * scale))
         label_font = ("Segoe UI", -max(6, round(12 * scale)))
         title_font = ("Segoe UI", -max(7, round(12 * scale)), "bold")
@@ -473,63 +786,165 @@ class Viewer:
             name = node["name"]
             if node["type"] == "Method":
                 name = ".".join(node["qualified_name"].split(".")[-2:])
-            if len(name) > 40:
-                name = "…" + name[-39:]
+            if len(name) > 26:
+                name = "…" + name[-25:]
+            if self.layout_mode.get() == "Hierarchy" and scale >= 0.65:
+                filename = node["source_ref"]["path"].rsplit("/", 1)[-1]
+                if len(filename) > 22:
+                    filename = "…" + filename[-21:]
+                name = f"{name}\n{filename}"
             label = canvas.create_text(
                 x * scale, y * scale, text=name, width=(NODE_WIDTH - 12) * scale,
                 font=label_font, tags="nodes", state="normal" if scale >= 0.36 else "hidden",
             )
             self.node_items[node_id] = (box, label)
             self.graph_nodes[box] = self.graph_nodes[label] = node_id
+            if node_id in self.notes_by_node:
+                marker_x = (x + NODE_WIDTH / 2 - 5) * scale
+                marker_y = (y - NODE_HEIGHT / 2 + 5) * scale
+                radius = max(2, 4 * scale)
+                marker = canvas.create_oval(marker_x - radius, marker_y - radius,
+                                            marker_x + radius, marker_y + radius,
+                                            fill=colors["both"], outline=colors["paper"], tags="nodes")
+                self.note_markers[node_id] = marker
+                self.graph_nodes[marker] = node_id
+        if self.io_enabled.get():
+            self.draw_io(positions, label_font)
         self.highlight_graph()
+
+    def draw_io(self, positions, font):
+        canvas, scale = self.graph, self.scale
+        ports = edge_ports(self.io["edges"], positions)
+        for edge in self.io["edges"]:
+            start, end = positions[edge["from_id"]], positions[edge["to_id"]]
+            points = edge_path(start, end, ports[edge["id"]])
+            line = canvas.create_line(*(value * scale for value in points), arrow="last",
+                                      smooth=True, dash=(2, 4), tags="edges")
+            label = canvas.create_text((points[2] + points[4]) * scale / 2,
+                                       (points[3] + points[5]) * scale / 2,
+                                       text="READ" if edge["type"] == "READS" else "WRITE",
+                                       font=font, state="hidden", tags="io_labels")
+            self.io_items[edge["id"]] = line, label
+        for resource_id, resource in self.resources.items():
+            x, y = positions[resource_id]
+            left, right = x - NODE_WIDTH / 2, x + NODE_WIDTH / 2
+            top, bottom = y - NODE_HEIGHT / 2, y + NODE_HEIGHT / 2
+            points = (left, top, right - 9, top, right, top + 9, right, bottom, left, bottom)
+            box = canvas.create_polygon(*(value * scale for value in points), tags="nodes")
+            name = resource["name"]
+            if len(name) > 24:
+                name = "…" + name[-23:]
+            label = canvas.create_text(x * scale, y * scale, text=f'{resource["kind"].upper()} · {name}',
+                                       font=font, width=(NODE_WIDTH - 12) * scale, tags="nodes",
+                                       state="normal" if scale >= 0.36 else "hidden")
+            self.resource_items[resource_id] = box, label
+            self.graph_nodes[box] = self.graph_nodes[label] = resource_id
+
+    def highlight_io(self, file_nodes, has_focus):
+        if not self.io_enabled.get():
+            self.io_summary.set("")
+            return set()
+        canvas, colors = self.graph, self.COLORS
+        related = set()
+        for edge in self.io["edges"]:
+            origin, target = edge["from_id"], edge["to_id"]
+            active = origin == self.focus_id or target == self.focus_resource or origin in file_nodes
+            if active:
+                related.update((origin, target))
+            line, label = self.io_items[edge["id"]]
+            key = "io_read" if edge["type"] == "READS" else "io_write"
+            canvas.itemconfigure(line, fill=colors[key] if active or not has_focus else colors["muted_line"],
+                                 width=max(2 if active else 1, self.scale * 2))
+            canvas.itemconfigure(label, fill=colors[key], state="normal" if active else "hidden")
+            if active:
+                canvas.tag_raise(line)
+                canvas.tag_raise(label)
+        for resource_id, (box, label) in self.resource_items.items():
+            active = resource_id in related or resource_id == self.focus_resource
+            visible = active or not has_focus
+            canvas.itemconfigure(box, fill=colors["io_fill" if visible else "muted_fill"],
+                                 outline=colors["io_read" if visible else "muted_line"])
+            canvas.itemconfigure(label, fill=colors["ink" if visible else "muted_ink"])
+            if active:
+                canvas.tag_raise(box)
+                canvas.tag_raise(label)
+        affected = sum(item["state"] != "CURRENT" for item in self.io["documents"])
+        unresolved = len(self.io["unresolved"])
+        parts = []
+        if self.resources:
+            parts.append(f'{len(self.resources)} I/O resources')
+        if affected:
+            parts.append(f"{affected} I/O documents need attention")
+        if unresolved:
+            parts.append(f"{unresolved} unresolved")
+        self.io_summary.set(" · ".join(parts))
+        return related
 
     def highlight_graph(self):
         canvas, colors = self.graph, self.COLORS
+        file_nodes = {
+            node["id"] for node in self.nodes
+            if self.focus_path and node["source_ref"]["path"] == self.focus_path
+        }
+        has_focus = bool(self.focus_id or file_nodes or self.focus_resource)
         callers, callees = set(), set()
         canvas.tag_raise("edges")
         canvas.tag_raise("nodes")
         for edge in self.edges:
             origin, target = edge["from_id"], edge["to_id"]
             incoming, outgoing = target == self.focus_id, origin == self.focus_id
+            within_file = origin in file_nodes and target in file_nodes
             if incoming:
                 callers.add(origin)
             if outgoing:
                 callees.add(target)
             item = self.edge_items[edge["id"]]
-            if incoming or outgoing:
+            if incoming or outgoing or within_file:
                 color = colors["both" if incoming and outgoing else "caller" if incoming else "accent"]
                 arrow = tuple(max(minimum, round(size * self.scale))
                               for minimum, size in ((6, 9), (8, 12), (3, 4)))
                 canvas.itemconfigure(item, fill=color, width=max(2, 3 * self.scale), arrowshape=arrow)
                 canvas.tag_raise(item)
             else:
-                color = colors["muted_line" if self.focus_id else "line"]
+                color = colors["muted_line" if has_focus else "line"]
                 arrow = tuple(max(1, round(value * self.scale)) for value in (8, 10, 3))
                 canvas.itemconfigure(item, fill=color, width=max(1, 1.5 * self.scale), arrowshape=arrow)
-        self.callers_label.set(f"Callers · {len(callers)}" if self.focus_id else "Callers")
-        self.callees_label.set(f"Callees · {len(callees)}" if self.focus_id else "Callees")
+        if self.focus_path:
+            self.callers_label.set("")
+            self.callees_label.set(f"File symbols · {len(file_nodes)}")
+        else:
+            self.callers_label.set(f"Callers · {len(callers)}" if self.focus_id else "Callers")
+            self.callees_label.set(f"Callees · {len(callees)}" if self.focus_id else "Callees")
+        io_neighbors = self.highlight_io(file_nodes, has_focus)
         for node_id, (box, label) in self.node_items.items():
             if node_id == self.focus_id:
-                fill, border, ink = ("selected", "accent", "white")
+                fill, border, ink = ("selected", "accent", "selected_ink")
             elif node_id in callers and node_id in callees:
                 fill, border, ink = ("both_fill", "both", "ink")
             elif node_id in callers:
                 fill, border, ink = ("caller_fill", "caller", "ink")
-            elif node_id in callees:
+            elif node_id in callees or node_id in file_nodes:
                 fill, border, ink = ("related", "accent", "ink")
-            elif self.focus_id:
+            elif node_id in io_neighbors:
+                fill, border, ink = ("io_fill", "io_read", "ink")
+            elif has_focus:
                 fill, border, ink = ("muted_fill", "muted_line", "muted_ink")
             else:
-                fill, border, ink = ("white", "border", "ink")
+                fill, border, ink = ("surface", "border", "ink")
             canvas.itemconfigure(box, fill=colors[fill], outline=colors[border])
             canvas.itemconfigure(label, fill=colors[ink])
-            if node_id == self.focus_id or node_id in callers or node_id in callees:
+            if node_id == self.focus_id or any(node_id in group for group in (callers, callees, file_nodes, io_neighbors)):
                 canvas.tag_raise(box)
                 canvas.tag_raise(label)
+                if node_id in self.note_markers:
+                    canvas.tag_raise(self.note_markers[node_id])
 
     def graph_clicked(self, _event):
         current = self.graph.find_withtag("current")
         if current:
             node_id = self.graph_nodes.get(current[0])
             if node_id:
-                self.select_symbol(node_id)
+                if node_id in self.resources:
+                    self.select_resource(node_id)
+                else:
+                    self.select_symbol(node_id)

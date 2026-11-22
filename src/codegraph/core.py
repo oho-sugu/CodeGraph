@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis import decode_source, digest, json_text, parse_file, python_files, relations, stable_id
+from . import io_facts
 
 
 SCHEMA_VERSION = 1
@@ -208,14 +209,19 @@ class Project:
                 old_nodes_by_path.setdefault(node["source_ref"]["path"], []).append(node)
             for path in python_files(self.source_root):
                 relative = path.relative_to(self.root).as_posix()
+                raw = None
                 try:
-                    file = parse_file(self.root, self.source_root, path)
+                    raw = path.read_bytes()
+                    file = parse_file(self.root, self.source_root, path, raw=raw)
                 except (SyntaxError, UnicodeError, OSError, ValueError) as error:
                     diagnostic = {"path": relative, "message": error.msg if isinstance(error, SyntaxError) else str(error)}
                     if isinstance(error, SyntaxError):
                         diagnostic.update(line=error.lineno, column=error.offset)
                     previous = previous_files.get(relative, {})
-                    files[relative] = {**previous, "diagnostic": diagnostic}
+                    files[relative] = {
+                        **previous, "diagnostic": diagnostic,
+                        "observed_hash": digest(raw) if raw is not None else None,
+                    }
                     for node in old_nodes_by_path.get(relative, ()):
                         nodes[node["id"]] = {**node, "stale": True}
                 else:
@@ -283,6 +289,38 @@ class Project:
         row = db.execute("SELECT run_id FROM graph_state WHERE slot = 1").fetchone()
         return row[0] if row else None
 
+    def status(self):
+        run_id, previous = None, {}
+        if self.db_path.exists():
+            with self.database() as db:
+                run_id = self.run_id(db)
+                previous = self.payloads(db, "SELECT path, payload FROM files")
+        current, unreadable = {}, {}
+        for path in python_files(self.source_root):
+            relative = path.relative_to(self.root).as_posix()
+            try:
+                current[relative] = digest(path.read_bytes())
+            except OSError as error:
+                unreadable[relative] = str(error)
+        seen = current.keys() | unreadable.keys()
+        changes = {
+            "added": sorted(seen - previous.keys()),
+            "removed": sorted(previous.keys() - seen),
+            "modified": sorted(
+                path for path in previous.keys() & current.keys()
+                if current[path] != previous[path].get("observed_hash", previous[path].get("source_hash"))
+            ),
+            "unreadable": [
+                {"path": path, "message": unreadable[path]} for path in sorted(unreadable)
+            ],
+        }
+        state = "unbuilt" if run_id is None else ("stale" if any(changes.values()) else "current")
+        return {
+            "project": str(self.root), "source_root": self.manifest["source_root"],
+            "state": state, "analysis_run_id": run_id, "changes": changes,
+            "diagnostics": [item["diagnostic"] for _, item in sorted(previous.items()) if item["diagnostic"]],
+        }
+
     @staticmethod
     def with_provenance(node, run_id):
         status = "UNKNOWN" if node["stale"] else "VERIFIED"
@@ -291,6 +329,50 @@ class Project:
     def symbols(self):
         with self.database() as db:
             return self.read_symbols(db, self.run_id(db))
+
+    def search(self, query, node_type=None, limit=30):
+        needle = query.strip().casefold()
+        if not needle or limit < 1:
+            raise CodeGraphError("Search requires non-empty text and a positive limit.")
+        if node_type is not None and node_type not in ONTOLOGY["nodes"]:
+            raise CodeGraphError(f"Unknown node type: {node_type}")
+        with self.database() as db:
+            run_id = self.run_id(db)
+            if run_id is None:
+                raise CodeGraphError("The graph is unbuilt. Run cg analyze first.")
+            nodes = self.payloads(db, "SELECT id, payload FROM nodes")
+            matching_notes = {}
+            for item in self.read_annotations():
+                if needle in item["text"].casefold():
+                    matching_notes.setdefault(item["target_node_id"], []).append(item)
+            hits = []
+            for node_id, node in nodes.items():
+                if node_type and node["type"] != node_type:
+                    continue
+                fields = {
+                    "name": node["name"].casefold(), "qualified_name": node["qualified_name"].casefold(),
+                    "path": node["source_ref"]["path"].casefold(),
+                }
+                matched = [field for field, value in fields.items() if needle in value]
+                notes = matching_notes.get(node_id, ())
+                if notes:
+                    matched.append("annotations")
+                if matched:
+                    name, qualified = fields["name"], fields["qualified_name"]
+                    rank = (needle not in (name, qualified), not name.startswith(needle),
+                            qualified, node_id)
+                    hits.append((rank, node, matched, notes))
+            hits.sort(key=lambda hit: hit[0])
+            return {
+                "query": query.strip(), "total": len(hits),
+                "matches": [
+                    {
+                        "node": self.with_provenance(node, run_id), "matched_fields": matched,
+                        "annotations": [self.annotation_state(item, node) for item in notes],
+                    }
+                    for _, node, matched, notes in hits[:limit]
+                ],
+            }
 
     def read_symbols(self, db, run_id):
         result = self.payloads(db, "SELECT id, payload FROM nodes WHERE type IN ('Function', 'Method')")
@@ -309,7 +391,58 @@ class Project:
             ]
             for edge in edges:
                 edge["provenance"]["analysis_run_id"] = run_id
-            return {"nodes": nodes, "edges": edges}
+            files = [path for (path,) in db.execute("SELECT path FROM files ORDER BY path")]
+            return {"nodes": nodes, "edges": edges, "files": files, "io": self.read_io_graph(db)}
+
+    def io_directory(self):
+        directory = self.home / "facts"
+        if not directory.resolve().is_relative_to(self.root):
+            raise CodeGraphError("The I/O facts directory must be inside the project.")
+        return directory
+
+    def import_io(self, path):
+        try:
+            document = io_facts.read_document(path)
+            with self.database(write=True) as db:
+                files = self.payloads(db, "SELECT path, payload FROM files")
+                nodes = self.payloads(db, "SELECT id, payload FROM nodes")
+                claims = io_facts.validate(document, nodes)
+                source = document["source"]
+                changed = io_facts.changed_inputs(self.root, document, {})
+                if changed:
+                    raise io_facts.IOFactError(f"Input hashes changed: {', '.join(changed)}")
+                outdated = io_facts.outdated_snapshot_inputs(document, files)
+                if outdated:
+                    raise io_facts.IOFactError(f"Update the static graph before importing: {', '.join(outdated)}")
+                io_facts.check_definitions(self.root, claims)
+                directory = self.io_directory()
+                directory.mkdir(exist_ok=True)
+                destination = directory / f"{stable_id('io', source)}.json"
+                atomic_write(destination, json_text(document) + "\n")
+                return {
+                    "source": source, "document": destination.relative_to(self.root).as_posix(),
+                    "accesses": len(claims), "unresolved": sum(resource is None for _, _, resource, _ in claims),
+                }
+        except io_facts.IOFactError as error:
+            raise CodeGraphError(str(error)) from error
+
+    def io_graph(self):
+        with self.database() as db:
+            return self.read_io_graph(db)
+
+    def read_io_graph(self, db):
+        paths = sorted(path for path in self.io_directory().glob("io_*.json") if not path.is_symlink())
+        if not paths:
+            return {"resources": [], "edges": [], "unresolved": [], "documents": [], "symbols": {}}
+        nodes = self.payloads(db, "SELECT id, payload FROM nodes")
+        files = self.payloads(db, "SELECT path, payload FROM files")
+        graph = io_facts.project_graph(self.root, paths, nodes, files)
+        origins = {edge["from_id"] for edge in graph["edges"]} | {
+            item["node_id"] for item in graph["unresolved"]
+        }
+        graph["symbols"] = {node_id: self.with_provenance(nodes[node_id], self.run_id(db))
+                            for node_id in sorted(origins)}
+        return graph
 
     @staticmethod
     def get_node(db, node_id):
@@ -378,11 +511,22 @@ class Project:
             return {"node": self.with_provenance(node, self.run_id(db)), **self.source_for(db, node)}
 
     def source_for(self, db, node):
-        row = db.execute("SELECT payload FROM files WHERE path = ?", (node["source_ref"]["path"],)).fetchone()
-        return self.live_source(node, json.loads(row[0]))
+        path = node["source_ref"]["path"]
+        return self.live_source(path, self.get_file(db, path))
 
-    def live_source(self, node, file):
-        path = (self.root / node["source_ref"]["path"]).resolve()
+    def file_source(self, path):
+        with self.database() as db:
+            return self.live_source(path, self.get_file(db, path))
+
+    @staticmethod
+    def get_file(db, path):
+        row = db.execute("SELECT payload FROM files WHERE path = ?", (path,)).fetchone()
+        if row is None:
+            raise CodeGraphError(f"Unknown source file: {path}")
+        return json.loads(row[0])
+
+    def live_source(self, relative, file):
+        path = (self.root / relative).resolve()
         if not path.is_relative_to(self.source_root):
             return {"source": None, "source_current": False}
         try:
@@ -392,7 +536,7 @@ class Project:
             return {"source": None, "source_current": False}
         return {
             "source": source,
-            "source_current": not node["stale"] and digest(raw) == file.get("source_hash"),
+            "source_current": not file["diagnostic"] and digest(raw) == file.get("source_hash"),
         }
 
     def read_annotations(self):
@@ -440,8 +584,7 @@ class Project:
             node = self.get_node(db, node_id)
             if node["type"] not in ("Function", "Method") or node["stale"]:
                 raise CodeGraphError("Select a current function or method to annotate.")
-            file = db.execute("SELECT payload FROM files WHERE path = ?", (node["source_ref"]["path"],)).fetchone()
-            if not self.live_source(node, json.loads(file[0]))["source_current"]:
+            if not self.source_for(db, node)["source_current"]:
                 raise CodeGraphError("Source changed since analysis. Run cg analyze and retry.")
             item = {
                 "id": str(uuid.uuid4()), "target_node_id": node_id, "type": kind, "text": body,

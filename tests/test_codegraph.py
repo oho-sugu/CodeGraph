@@ -399,6 +399,141 @@ class Conditional:
         self.assertIn("Unknown node", unknown.stderr)
         self.assertEqual(cg("refs", node["id"], "--direction", "invalid").returncode, 2)
 
+    def test_cli_search_and_graph_status(self):
+        def cg_json(*args):
+            result = subprocess.run(
+                [sys.executable, "-m", "codegraph", *args, "--format", "json"],
+                cwd=self.root / "src/pkg", capture_output=True, encoding="utf-8",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        self.assertEqual(cg_json("status")["state"], "unbuilt")
+        report = cg_json("update")
+        current = cg_json("status")
+        self.assertEqual(current["state"], "current")
+        self.assertEqual(current["analysis_run_id"], report["analysis_run_id"])
+
+        hit, = cg_json("search", "CALLBACK", "--type", "Method")["matches"]
+        node = hit["node"]
+        self.assertEqual(node["qualified_name"], "app.Worker.callback")
+        self.assertIn("name", hit["matched_fields"])
+        self.project.annotate(node["id"], "NOTE", "この分岐を再確認")
+        note, = cg_json("search", "分岐")["matches"]
+        self.assertEqual(note["node"]["id"], node["id"])
+        self.assertEqual(note["matched_fields"], ["annotations"])
+        self.assertEqual(note["annotations"][0]["status"], "ACTIVE")
+        path = cg_json("search", "pkg/service.py", "--limit", "1")
+        self.assertGreater(path["total"], len(path["matches"]))
+        self.assertIn("path", path["matches"][0]["matched_fields"])
+
+        self.write("src/app.py", "def invalid(\n")
+        self.write("src/added.py", "")
+        (self.root / "src/pkg/util.py").unlink()
+        changes = cg_json("status")
+        self.assertEqual(changes["state"], "stale")
+        self.assertEqual(changes["changes"], {
+            "added": ["src/added.py"], "modified": ["src/app.py"],
+            "removed": ["src/pkg/util.py"], "unreadable": [],
+        })
+        cg_json("update")
+        broken = cg_json("status")
+        self.assertEqual(broken["state"], "current")
+        self.assertEqual(broken["diagnostics"][0]["path"], "src/app.py")
+        self.write("src/app.py", "def broken[\n")
+        self.assertEqual(cg_json("status")["changes"]["modified"], ["src/app.py"])
+
+    def test_hierarchy_preserves_shared_callees_and_cycles(self):
+        from codegraph.hierarchy import hierarchy_layout
+
+        nodes = [{"id": name} for name in ("root", "left", "right", "shared", "cycle", "last", "alone")]
+        edges = [
+            {"from_id": origin, "to_id": target}
+            for origin, target in (
+                ("root", "left"), ("root", "right"), ("left", "shared"), ("right", "shared"),
+                ("shared", "cycle"), ("cycle", "shared"), ("cycle", "last"),
+            )
+        ]
+        _, positions, _ = hierarchy_layout(nodes, edges, 154, 30)
+        self.assertEqual(len(positions), len(nodes))
+        self.assertEqual(len(set(positions.values())), len(nodes))
+        self.assertEqual(positions["left"][0], positions["right"][0])
+        self.assertEqual(positions["shared"][0], positions["cycle"][0])
+        self.assertLess(positions["root"][0], positions["left"][0])
+        self.assertLess(positions["left"][0], positions["shared"][0])
+        self.assertLess(positions["shared"][0], positions["last"][0])
+        self.assertGreater(positions["alone"][1], max(y for name, (_, y) in positions.items() if name != "alone"))
+
+    def test_io_import_links_methods_and_resources_and_tracks_stale_inputs(self):
+        from codegraph.analysis import digest
+
+        self.write("src/access.py", """\
+class Store:
+    def read(self, db):
+        return db.execute("SELECT * FROM orders")
+
+    def write(self, db):
+        db.execute("INSERT INTO orders VALUES (1)")
+
+    def export(self, sink):
+        sink.write("orders")
+        open("orders.csv", "w").write("orders")
+""")
+        self.write("schema.sql", "CREATE TABLE orders (id INT);\n")
+        self.project.analyze()
+        symbols = self.symbols()
+        table = {"kind": "table", "database": "app", "schema": "main", "name": "orders",
+                 "definition": {"path": "schema.sql", "line": 1}}
+        export = symbols["access.Store.export"]["id"]
+        claims = [
+            {"node_id": symbols["access.Store.read"]["id"], "operation": "READS", "resource": table, "line": 3},
+            {"node_id": symbols["access.Store.write"]["id"], "operation": "WRITES", "resource": table, "line": 6},
+            {"node_id": export, "operation": "WRITES", "line": 9,
+             "resource": {"kind": "handle", "anchor": {"kind": "parameter", "node_id": export, "name": "sink"}}},
+            {"node_id": export, "operation": "WRITES", "line": 10,
+             "resource": {"kind": "file", "path": "orders.csv"}},
+            {"node_id": export, "operation": "READS", "line": 9, "resource": None, "reason": "Runtime target"},
+        ]
+        source = "src/access.py"
+        document = {
+            "version": 1, "source": source, "accesses": claims,
+            "inputs": {path: digest((self.root / path).read_bytes()) for path in (source, "schema.sql")},
+        }
+        artifact = self.root / "agent-output.json"
+        artifact.write_text(json.dumps(document), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "codegraph", "import-io", str(artifact), "--format", "json"],
+            cwd=self.root, capture_output=True, encoding="utf-8",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual((report["accesses"], report["unresolved"]), (5, 1))
+        graph = self.project.call_graph()["io"]
+        self.assertEqual({item["kind"] for item in graph["resources"]}, {"table", "file", "handle"})
+        table_node = next(item for item in graph["resources"] if item["kind"] == "table")
+        self.assertEqual(table_node["definitions"], [table["definition"]])
+        table_edges = [item for item in graph["edges"] if item["to_id"] == table_node["id"]]
+        self.assertEqual({item["type"] for item in table_edges}, {"READS", "WRITES"})
+        self.assertEqual({item["provenance"]["status"] for item in table_edges}, {"INFERRED"})
+        self.assertEqual(graph["unresolved"][0]["reason"], "Runtime target")
+
+        self.project.analyze()
+        self.assertEqual(self.project.io_graph(), graph)
+        self.project.db_path.unlink()
+        self.project.analyze()
+        self.assertEqual(self.project.io_graph(), graph)
+        previous = (self.root / report["document"]).read_bytes()
+        claims[0]["line"] = 99
+        artifact.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(CodeGraphError, "outside"):
+            self.project.import_io(artifact)
+        self.assertEqual((self.root / report["document"]).read_bytes(), previous)
+        self.write("schema.sql", "CREATE TABLE orders (id INT, note TEXT);\n")
+        stale = self.project.io_graph()
+        self.assertEqual(stale["edges"], [])
+        self.assertEqual(stale["documents"][0]["state"], "STALE")
+        self.assertEqual(stale["documents"][0]["changed_inputs"], ["schema.sql"])
+
     def test_tk_source_selection(self):
         try:
             import tkinter as tk
@@ -470,7 +605,7 @@ class Conditional:
         self.assertEqual(node_fill(node), viewer.COLORS["selected"])
         self.assertEqual(len(viewer.node_items), len(graph["nodes"]))
         viewer.clear_focus()
-        self.assertEqual(node_fill(unrelated), viewer.COLORS["white"])
+        self.assertEqual(node_fill(unrelated), viewer.COLORS["surface"])
         self.write("src/app.py", FIXTURES["app.py"])
         viewer.query.set("  WORKER.CALL ")
         self.assertEqual(viewer.symbols.get_children(), (target["id"],))
@@ -520,7 +655,103 @@ class Conditional:
         self.assertEqual(styled_text("comment"), ["# hi"])
         self.assertEqual(styled_text("line_number")[:2], ["1  ", "2  "])
         self.assertIn("return 42", styled_text("focus")[0])
+        self.assertEqual(viewer.keyword_font.cget("weight"), "bold")
         viewer.show_source('if ready:\n    value = """unfinished', None)
         self.assertEqual(styled_text("keyword"), ["if"])
         self.assertIn("unfinished", viewer.source.get("1.0", "end"))
         self.assertEqual(viewer.source.cget("state"), "disabled")
+
+        self.assertTrue(viewer.dark_mode.get())
+        dark_background = viewer.source.cget("background")
+        dark_keyword = viewer.source.tag_cget("keyword", "foreground")
+        self.assertEqual(viewer.style.lookup("TNotebook.Tab", "background", ("selected",)),
+                         viewer.COLORS["surface"])
+        viewer.dark_mode.set(False)
+        viewer.apply_theme()
+        self.assertNotEqual(viewer.source.cget("background"), dark_background)
+        self.assertNotEqual(viewer.source.tag_cget("keyword", "foreground"), dark_keyword)
+        self.assertEqual(styled_text("keyword"), ["if"])
+        viewer.dark_mode.set(True)
+        viewer.apply_theme()
+        self.assertEqual(viewer.source.cget("background"), dark_background)
+
+        self.assertEqual(viewer.layout_mode.get(), "Hierarchy")
+        hierarchy_positions = viewer.layout[1]
+        viewer.layout_mode.set("By file")
+        viewer.change_layout()
+        self.assertNotEqual(viewer.layout[1], hierarchy_positions)
+        self.assertEqual(viewer.focus_id, unrelated["id"])
+        self.assertEqual(len(viewer.node_items), len(graph["nodes"]))
+        self.assertEqual(len(viewer.edge_items), len(graph["edges"]))
+        viewer.layout_mode.set("Hierarchy")
+        viewer.change_layout()
+        self.assertEqual(viewer.layout[1], hierarchy_positions)
+
+        viewer.sidebar.select(viewer.files_tab)
+        self.assertIn("src/pkg/__init__.py", graph["files"])
+        self.assertEqual(viewer.file_tree.item(viewer.file_tree.parent("src/pkg/__init__.py"), "text"), "pkg")
+        viewer.file_query.set("PKG\\SERVICE.PY")
+        self.assertEqual(viewer.visible_files, ["src/pkg/service.py"])
+        viewer.open_first_file(None)
+        self.assertIsNone(viewer.focus_id)
+        self.assertEqual(viewer.focus_path, "src/pkg/service.py")
+        self.assertIn("def done", viewer.source.get("1.0", "end"))
+        self.assertFalse(viewer.source.tag_ranges("focus"))
+        viewer.file_query.set("APP.PY")
+        viewer.open_first_file(None)
+        self.assertEqual(viewer.focus_path, "src/app.py")
+        for symbol in graph["nodes"]:
+            active = symbol["source_ref"]["path"] == "src/app.py"
+            self.assertEqual(node_fill(symbol), viewer.COLORS["related" if active else "muted_fill"])
+        self.assertEqual(len(viewer.edge_items), len(graph["edges"]))
+        viewer.clear_focus()
+        self.assertIsNone(viewer.focus_path)
+        self.assertFalse(viewer.file_tree.selection())
+        self.assertTrue(viewer.add_note_button.instate(["disabled"]))
+        viewer.select_symbol(node["id"])
+        self.assertTrue(viewer.add_note_button.instate(["!disabled"]))
+        viewer.add_note_button.invoke()
+        dialog = next(child for child in window.winfo_children() if isinstance(child, tk.Toplevel))
+        contents = dialog.winfo_children()[0].winfo_children()
+        editor = next(child for child in contents if isinstance(child, tk.Text))
+        save = next(button for button in contents[-1].winfo_children() if button.cget("text") == "Save note")
+        save.invoke()
+        self.assertTrue(dialog.winfo_exists())
+        editor.insert("1.0", "入口\nこの分岐を再確認")
+        save.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        annotation = self.project.inspect(node["id"])["annotations"][0]
+        self.assertEqual(annotation["text"], "入口\nこの分岐を再確認")
+        self.assertEqual(viewer.note_text.get("1.0", "end-1c"), "NOTE · ACTIVE\n入口\nこの分岐を再確認")
+        self.assertIn(node["id"], viewer.note_markers)
+        viewer.refresh()
+        self.assertIn(node["id"], viewer.note_markers)
+        viewer.select_symbol(target["id"])
+        self.assertIn("No notes yet", viewer.note_text.get("1.0", "end"))
+
+        from codegraph.analysis import digest
+
+        access = {
+            "version": 1, "source": "src/app.py",
+            "inputs": {"src/app.py": digest((self.root / "src/app.py").read_bytes())},
+            "accesses": [{
+                "node_id": target["id"], "operation": "WRITES", "line": target["source_ref"]["start_line"] + 1,
+                "resource": {"kind": "file", "path": "out.csv"},
+            }],
+        }
+        artifact = self.root / "io.json"
+        artifact.write_text(json.dumps(access), encoding="utf-8")
+        self.project.import_io(artifact)
+        viewer.refresh()
+        resource_id, = viewer.resource_items
+        box, _ = viewer.resource_items[resource_id]
+        with patch.object(viewer.graph, "find_withtag", return_value=(box,)):
+            viewer.graph_clicked(None)
+        self.assertEqual(viewer.focus_resource, resource_id)
+        self.assertEqual(node_fill(target), viewer.COLORS["io_fill"])
+        self.assertIn("WRITES  app.Worker.callback", viewer.source.get("1.0", "end"))
+        self.assertEqual(len(viewer.edge_items), len(graph["edges"]))
+        viewer.io_enabled.set(False)
+        viewer.change_layout()
+        self.assertFalse(viewer.resource_items)
+        self.assertIsNone(viewer.focus_resource)

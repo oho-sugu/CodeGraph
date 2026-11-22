@@ -281,14 +281,15 @@ class ParsedFile:
             self.collect(syntax.body, scope)
 
 
-def parse_file(project, root, path):
+def parse_file(project, root, path, *, raw=None):
     relative = path.relative_to(project).as_posix()
     parts = list(path.relative_to(root).with_suffix("").parts)
     package = parts[-1] == "__init__"
     if package and len(parts) > 1:
         parts.pop()
     module = ".".join(parts)
-    raw = path.read_bytes()
+    if raw is None:
+        raw = path.read_bytes()
     source = decode_source(raw)
     tree = ast.parse(source, filename=relative, type_comments=True)
     # Compile checks invalid scope constructs that AST parsing alone accepts.

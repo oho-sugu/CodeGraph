@@ -29,6 +29,15 @@ def parser():
     initialize = command("init", "Create or open a CodeGraph project")
     initialize.add_argument("--source-root", help="Source directory relative to the project")
     command("analyze", "Rebuild the static graph from Python source")
+    command("update", "Refresh the static graph from Python source")
+    command("status", "Check whether Python sources match the stored graph")
+    imported = command("import-io", "Validate and store an agent-produced I/O document")
+    imported.add_argument("path", type=Path)
+    command("io", "List imported I/O resources, accesses, and document status")
+    search = command("search", "Find nodes by name, path, or attached annotation text")
+    search.add_argument("query")
+    search.add_argument("--type", choices=tuple(ONTOLOGY["nodes"]), dest="node_type")
+    search.add_argument("--limit", type=int, default=30)
     inspect = command("inspect", "Inspect a node or list analyzed functions and methods")
     selection = inspect.add_mutually_exclusive_group()
     selection.add_argument("node_id", nargs="?")
@@ -62,7 +71,7 @@ def annotation_line(item):
 def render(command, result):
     if command == "init":
         return f'CodeGraph project at {result["project"]}'
-    if command == "analyze":
+    if command in ("analyze", "update"):
         summary = (
             f'{result["files"]} files, {result["nodes"]} nodes, {result["edges"]} edges, '
             f'{result["unresolved_calls"]} unresolved calls.'
@@ -72,6 +81,31 @@ def render(command, result):
             for item in result["diagnostics"]
         ]
         return "\n".join([summary, *diagnostics])
+    if command == "status":
+        lines = [f'Graph: {result["state"]}']
+        for label in ("added", "modified", "removed"):
+            lines.extend(f'  {label}: {path}' for path in result["changes"][label])
+        lines.extend(f'  unreadable: {item["path"]}: {item["message"]}'
+                     for item in result["changes"]["unreadable"])
+        lines.extend(f'  diagnostic: {item["path"]}: {item["message"]}' for item in result["diagnostics"])
+        return "\n".join(lines)
+    if command == "import-io":
+        return f'Imported {result["accesses"]} accesses for {result["source"]} ({result["unresolved"]} unresolved).'
+    if command == "io":
+        resources = {item["id"]: item["name"] for item in result["resources"]}
+        lines = [f'{result["symbols"][edge["from_id"]]["qualified_name"]} {edge["type"]} {resources[edge["to_id"]]}'
+                 for edge in result["edges"]]
+        lines.extend(f'{item["state"]}: {item.get("source", item["document"])}' for item in result["documents"]
+                     if item["state"] != "CURRENT")
+        if result["unresolved"]:
+            lines.append(f'{len(result["unresolved"])} unresolved accesses.')
+        return "\n".join(lines) or "No I/O accesses found."
+    if command == "search":
+        lines = [f'{symbol_line(item["node"])}  ({", ".join(item["matched_fields"])})'
+                 for item in result["matches"]]
+        if len(lines) < result["total"]:
+            lines.append(f'Showing {len(lines)} of {result["total"]} matches.')
+        return "\n".join(lines) or "No matching nodes."
     if command == "inspect":
         if "nodes" in result:
             return "\n".join(map(symbol_line, result["nodes"])) or "No functions or methods found."
@@ -108,8 +142,16 @@ def execute(args):
         return {"project": str(project.root), "manifest": project.manifest}
     project = discover(project_path)
     match args.command:
-        case "analyze":
+        case "analyze" | "update":
             return project.analyze()
+        case "status":
+            return project.status()
+        case "import-io":
+            return project.import_io(args.path)
+        case "io":
+            return project.io_graph()
+        case "search":
+            return project.search(args.query, args.node_type, args.limit)
         case "inspect":
             if args.annotations:
                 return {"annotations": project.annotations()}
