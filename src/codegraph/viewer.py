@@ -107,9 +107,22 @@ class Viewer:
         panes.add(graph, weight=5)
         panes.add(source, weight=2)
 
-        self.symbols = ttk.Treeview(symbols, show="tree", selectmode="browse", takefocus=True)
+        symbols.columnconfigure(0, weight=1)
+        symbols.rowconfigure(2, weight=1)
+        self.query = tk.StringVar()
+        ttk.Label(symbols, text="Search symbols").grid(row=0, column=0, sticky="w")
+        self.search = ttk.Entry(symbols, textvariable=self.query)
+        self.search.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        self.search.bind("<Return>", self.open_first_match)
+        self.search.bind("<Escape>", self.clear_search)
+        root.bind("<Control-f>", self.focus_search)
+        results = ttk.Frame(symbols)
+        results.grid(row=2, column=0, sticky="nsew")
+        self.search_summary = tk.StringVar()
+        ttk.Label(symbols, textvariable=self.search_summary).grid(row=3, column=0, sticky="w")
+        self.symbols = ttk.Treeview(results, show="tree", selectmode="browse", takefocus=True)
         self.symbols.column("#0", width=225, minwidth=135)
-        self.scrollable(symbols, self.symbols, ttk, horizontal=True)
+        self.scrollable(results, self.symbols, ttk, horizontal=True)
         self.symbols.bind("<<TreeviewSelect>>", self.selection_changed)
 
         graph.columnconfigure(0, weight=1)
@@ -149,6 +162,7 @@ class Viewer:
         self.scrollable(source, self.source, ttk, horizontal=True)
         self.status = tk.StringVar()
         ttk.Label(main, textvariable=self.status).pack(fill="x", pady=(8, 0))
+        self.query.trace_add("write", self.update_symbol_list)
         self.refresh()
 
     @staticmethod
@@ -165,7 +179,6 @@ class Viewer:
             widget.configure(xscrollcommand=bottom.set)
 
     def refresh(self):
-        selected = self.symbols.selection()
         try:
             data = self.project.call_graph()
         except (CodeGraphError, OSError, sqlite3.Error) as error:
@@ -174,29 +187,82 @@ class Viewer:
         self.nodes, self.edges = data["nodes"], data["edges"]
         self.layout = layout_graph(self.nodes)
         self.graph_summary.set(f"{len(self.nodes)} symbols · {len(self.edges)} calls")
-        self.symbols.delete(*self.symbols.get_children())
-        for node in self.nodes:
-            suffix = " [stale]" if node["stale"] else ""
-            self.symbols.insert("", "end", iid=node["id"], text=node["qualified_name"] + suffix)
-        self.focus_id = selected[0] if selected and self.symbols.exists(selected[0]) else None
-        if self.focus_id:
-            self.symbols.selection_set(self.focus_id)
-            self.symbols.see(self.focus_id)
+        if self.focus_id not in self.layout[1]:
+            self.focus_id = None
+        self.update_symbol_list()
         if self.fitting:
             self.fit_graph()
         else:
             self.draw_graph()
-        self.selection_changed(None)
+        self.render_selection()
+
+    def update_symbol_list(self, *_trace):
+        query = self.query.get().strip().casefold()
+        matches = self.nodes
+        if query:
+            ranked = []
+            for node in self.nodes:
+                qualified = node["qualified_name"].casefold()
+                name = node["name"].casefold()
+                if query in qualified:
+                    rank = (query not in (name, qualified), not name.startswith(query))
+                    ranked.append((rank, node))
+            matches = [node for _, node in sorted(ranked, key=lambda hit: hit[0])]
+        if not query:
+            self.search_summary.set("")
+        elif matches:
+            self.search_summary.set(f"{len(matches)} " + ("match" if len(matches) == 1 else "matches"))
+        else:
+            self.search_summary.set("No matching symbols")
+        self.symbols.delete(*self.symbols.get_children())
+        for node in matches:
+            suffix = " [stale]" if node["stale"] else ""
+            self.symbols.insert("", "end", iid=node["id"], text=node["qualified_name"] + suffix)
+        if self.focus_id and self.symbols.exists(self.focus_id):
+            self.symbols.selection_set(self.focus_id)
+            self.symbols.see(self.focus_id)
+
+    def focus_search(self, _event):
+        self.search.focus_set()
+        self.search.selection_range(0, "end")
+        return "break"
+
+    def clear_search(self, _event):
+        if self.query.get():
+            self.query.set("")
+            return "break"
+        return None
+
+    def open_first_match(self, _event):
+        matches = self.symbols.get_children()
+        if matches:
+            self.select_symbol(matches[0])
+        return "break"
 
     def clear_focus(self):
+        self.focus_id = None
         self.symbols.selection_remove(*self.symbols.selection())
-        self.selection_changed(None)
+        self.render_selection()
 
     def selection_changed(self, _event):
         selection = self.symbols.selection()
-        self.focus_id = selection[0] if selection else None
+        if selection and selection[0] != self.focus_id:
+            self.select_symbol(selection[0])
+
+    def select_symbol(self, node_id):
+        self.focus_id = node_id
+        if self.symbols.exists(node_id):
+            if self.symbols.selection() != (node_id,):
+                self.symbols.selection_set(node_id)
+            self.symbols.see(node_id)
+        else:
+            self.symbols.selection_remove(*self.symbols.selection())
+        self.reveal_node(node_id)
+        self.render_selection()
+
+    def render_selection(self):
         self.highlight_graph()
-        if not selection:
+        if not self.focus_id:
             self.show_source("", None)
             self.status.set("Select a function or method to see its calls and source." if self.nodes
                             else "Run cg analyze to add Python functions and methods.")
@@ -211,7 +277,7 @@ class Viewer:
         ref = node["source_ref"]
         current = data["source_current"]
         self.show_source(data["source"] or "", ref if current else None)
-        location = f'{ref["path"]}:{ref["start_line"]}'
+        location = f'{node["qualified_name"]} · {ref["path"]}:{ref["start_line"]}'
         self.status.set(location if current else f"{location} · Source changed. Run cg analyze and refresh.")
 
     def show_source(self, source, ref):
@@ -258,6 +324,20 @@ class Viewer:
         width, height = self.layout[2]
         canvas.xview_moveto((center_x * self.scale - screen_x) / (width * self.scale))
         canvas.yview_moveto((center_y * self.scale - screen_y) / (height * self.scale))
+
+    def reveal_node(self, node_id):
+        canvas = self.graph
+        if canvas.winfo_width() <= 1 or canvas.winfo_height() <= 1:
+            return
+        box, _ = self.node_items[node_id]
+        left, top, right, bottom = canvas.coords(box)
+        width, height = self.layout[2]
+        for start, end, origin, visible, extent, move in (
+            (left, right, canvas.canvasx(0), canvas.winfo_width(), width, canvas.xview_moveto),
+            (top, bottom, canvas.canvasy(0), canvas.winfo_height(), height, canvas.yview_moveto),
+        ):
+            if start < origin or end > origin + visible:
+                move(((start + end - visible) / 2) / (extent * self.scale))
 
     def draw_graph(self):
         canvas, colors = self.graph, self.COLORS
@@ -336,6 +416,5 @@ class Viewer:
         current = self.graph.find_withtag("current")
         if current:
             node_id = self.graph_nodes.get(current[0])
-            if node_id and self.symbols.exists(node_id):
-                self.symbols.selection_set(node_id)
-                self.symbols.see(node_id)
+            if node_id:
+                self.select_symbol(node_id)
