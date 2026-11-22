@@ -1,6 +1,9 @@
 """Standalone Tk window for reading the local call graph and its source."""
 
+import io
+import keyword
 import sqlite3
+import tokenize
 from collections import defaultdict
 from math import ceil
 
@@ -11,6 +14,37 @@ NODE_WIDTH = 154
 NODE_HEIGHT = 30
 COLUMN_STEP = 180
 ROW_STEP = 43
+SOURCE_COLORS = {
+    "line_number": "#536782",
+    "keyword": "#6231a1",
+    "string": "#166044",
+    "comment": "#526577",
+    "number": "#93441a",
+}
+TOKEN_STYLES = {
+    tokenize.STRING: "string",
+    tokenize.FSTRING_START: "string",
+    tokenize.FSTRING_MIDDLE: "string",
+    tokenize.FSTRING_END: "string",
+    tokenize.TSTRING_START: "string",
+    tokenize.TSTRING_MIDDLE: "string",
+    tokenize.TSTRING_END: "string",
+    tokenize.COMMENT: "comment",
+    tokenize.NUMBER: "number",
+}
+
+
+def source_styles(source):
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            style = TOKEN_STYLES.get(token.type)
+            if token.type == tokenize.NAME and keyword.iskeyword(token.string):
+                style = "keyword"
+            if style:
+                yield style, token.start, token.end
+    except (tokenize.TokenError, SyntaxError):
+        # Keep the readable text and any tokens emitted before a syntax error.
+        return
 
 
 def layout_graph(nodes):
@@ -159,6 +193,8 @@ class Viewer:
             foreground=self.COLORS["ink"],
         )
         self.source.tag_configure("focus", background=self.COLORS["related"])
+        for tag, color in SOURCE_COLORS.items():
+            self.source.tag_configure(tag, foreground=color)
         self.scrollable(source, self.source, ttk, horizontal=True)
         self.status = tk.StringVar()
         ttk.Label(main, textvariable=self.status).pack(fill="x", pady=(8, 0))
@@ -287,11 +323,26 @@ class Viewer:
         digits = len(str(len(lines)))
         numbered = "\n".join(f"{number:>{digits}}  {line}" for number, line in enumerate(lines, 1))
         self.source.insert("1.0", numbered)
+        if lines:
+            self.color_source(source, lines, digits + 2)
         if ref:
             first = f'{ref["start_line"]}.0'
             self.source.tag_add("focus", first, f'{ref["end_line"] + 1}.0')
             self.source.yview(first)
         self.source.configure(state="disabled")
+
+    def color_source(self, source, lines, gutter):
+        ranges = defaultdict(list)
+        for line in range(1, len(lines) + 1):
+            ranges["line_number"].extend((f"{line}.0", f"{line}.{gutter}"))
+        for tag, (first_line, first_col), (last_line, last_col) in source_styles(source):
+            for line in range(first_line, min(last_line, len(lines)) + 1):
+                start = first_col if line == first_line else 0
+                end = last_col if line == last_line else len(lines[line - 1])
+                if start < end:
+                    ranges[tag].extend((f"{line}.{gutter + start}", f"{line}.{gutter + end}"))
+        for tag, indices in ranges.items():
+            self.source.tag_add(tag, *indices)
 
     def resize_graph(self, _event):
         if self.fitting and self.nodes and abs(self.fit_scale() - self.scale) > 0.001:

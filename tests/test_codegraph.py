@@ -489,3 +489,22 @@ class Conditional:
         viewer.clear_search(None)
         self.assertEqual(len(viewer.symbols.get_children()), len(graph["nodes"]))
         self.assertEqual(viewer.symbols.selection(), (unrelated["id"],))
+        viewer.show_source(
+            'def example():\n    message = "🧪"; return 42  # hi\n    note = """first\nsecond"""\n',
+            {"start_line": 2, "end_line": 2},
+        )
+
+        def styled_text(tag):
+            indices = viewer.source.tag_ranges(tag)
+            return [viewer.source.get(first, last) for first, last in zip(indices[::2], indices[1::2])]
+
+        self.assertEqual(styled_text("keyword"), ["def", "return"])
+        self.assertEqual(styled_text("string"), ['"🧪"', '"""first', 'second"""'])
+        self.assertEqual(styled_text("number"), ["42"])
+        self.assertEqual(styled_text("comment"), ["# hi"])
+        self.assertEqual(styled_text("line_number")[:2], ["1  ", "2  "])
+        self.assertIn("return 42", styled_text("focus")[0])
+        viewer.show_source('if ready:\n    value = """unfinished', None)
+        self.assertEqual(styled_text("keyword"), ["if"])
+        self.assertIn("unfinished", viewer.source.get("1.0", "end"))
+        self.assertEqual(viewer.source.cget("state"), "disabled")
