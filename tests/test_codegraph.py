@@ -889,3 +889,103 @@ class Store:
             browser.delete_button.invoke()
         self.assertEqual(self.project.annotations(), [])
         self.assertFalse(browser.tree.get_children())
+
+    def test_tk_multi_selection_and_frame_layout(self):
+        from types import SimpleNamespace
+
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except ImportError as error:
+            self.skipTest(str(error))
+        try:
+            window = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(str(error))
+        self.addCleanup(window.destroy)
+        window.withdraw()
+        from codegraph.analysis import digest
+        from codegraph.viewer import Viewer
+
+        self.project.analyze()
+        symbols = self.symbols()
+        method = symbols["app.Worker.execute"]
+        source = method["source_ref"]["path"]
+        method_id = method["id"]
+        graph = self.project.call_graph()
+        artifact = self.root / "io.json"
+        artifact.write_text(json.dumps({
+            "version": 1, "source": source, "inputs": {source: digest((self.root / source).read_bytes())},
+            "accesses": [{
+                "node_id": method_id, "operation": "READS", "line": method["source_ref"]["start_line"] + 1,
+                "resource": resource,
+            } for resource in (
+                {"kind": "table", "database": "app", "schema": "main", "name": "records"},
+                {"kind": "file", "path": "out.csv"},
+            )],
+        }), encoding="utf-8")
+        self.project.import_io(artifact)
+        viewer = Viewer(window, self.project, tk, ttk)
+        viewer.layout_mode.set("By file")
+        viewer.change_layout()
+        table_id = viewer.frame_member_ids("Tables")[0]
+
+        start = SimpleNamespace(x=20, y=20)
+        end = SimpleNamespace(x=70, y=60)
+
+        def press(item, *, selecting=False, event=start):
+            with patch.object(viewer.graph, "find_withtag", return_value=(item,) if item else ()):
+                viewer.start_graph_drag(event, selecting=selecting)
+
+        def drag(item):
+            press(item)
+            viewer.drag_graph(end)
+            viewer.end_graph_drag(end)
+
+        method_box = viewer.node_items[method_id][0]
+        press(method_box, selecting=True)
+        viewer.end_graph_drag(start)
+        self.assertEqual(viewer.selected_nodes, {method_id})
+        table_box = viewer.resource_items[table_id][0]
+        x1, y1, x2, y2 = viewer.graph.coords(table_box)[:4]
+        x_offset, y_offset = viewer.graph.canvasx(0), viewer.graph.canvasy(0)
+        corner = SimpleNamespace(x=x1 - x_offset + 1, y=y1 - y_offset + 1)
+        opposite = SimpleNamespace(x=x2 - x_offset - 1, y=y2 - y_offset + 6)
+        press(None, selecting=True, event=corner)
+        viewer.drag_graph(opposite)
+        viewer.end_graph_drag(opposite)
+        self.assertEqual(viewer.selected_nodes, {method_id, table_id})
+
+        positions = dict(viewer.layout[1])
+        drag(method_box)
+        dx, dy = (end.x - start.x) / viewer.scale, (end.y - start.y) / viewer.scale
+        self.assertEqual(viewer.layout[1], {
+            node_id: (x + dx, y + dy) if node_id in viewer.selected_nodes else (x, y)
+            for node_id, (x, y) in positions.items()
+        })
+
+        for name in (source, "Tables", "Files and handles"):
+            positions = dict(viewer.layout[1])
+            bounds = viewer.frame_bounds[name]
+            members = viewer.frame_member_ids(name)
+            drag(viewer.frame_items[name][1])
+            self.assertEqual(viewer.frame_bounds[name], tuple(
+                value + offset for value, offset in zip(bounds, (dx, dy, dx, dy))
+            ))
+            self.assertEqual(viewer.layout[1], {
+                node_id: (x + dx, y + dy) if node_id in members else (x, y)
+                for node_id, (x, y) in positions.items()
+            })
+            moved = dict(viewer.layout[1])
+            left, top, right, bottom = viewer.frame_bounds[name]
+            drag(viewer.frame_items[name][-1])
+            self.assertEqual(viewer.frame_bounds[name], (left, top, right + dx, bottom + dy))
+            self.assertEqual(viewer.layout[1], moved)
+
+        reloaded = Viewer(tk.Toplevel(window), self.project, tk, ttk)
+        self.assertNotEqual(reloaded.frame_bounds["Tables"], viewer.frame_bounds["Tables"])
+        reloaded.layout_mode.set("By file")
+        reloaded.change_layout()
+        self.assertEqual(reloaded.frame_bounds, viewer.frame_bounds)
+        self.assertEqual(reloaded.layout[1], viewer.layout[1])
+        self.assertEqual(self.project.call_graph()["edges"], graph["edges"])

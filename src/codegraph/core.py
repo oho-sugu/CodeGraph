@@ -519,27 +519,43 @@ class Project:
             return self.live_source(path, self.get_file(db, path))
 
     def view_positions(self):
+        return self.view_layout()[0]
+
+    def view_layout(self):
         path = self.home / "view-layout.json"
         if not path.exists():
-            return {}
+            return {}, {}
         data = read_json(path)
         if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("layouts"), dict):
             raise CodeGraphError("Invalid view-layout.json.")
         layouts = data["layouts"]
-        for positions in layouts.values():
-            if not isinstance(positions, dict) or any(
-                not isinstance(point, list) or len(point) != 2
-                or any(type(value) not in (int, float) or not 0 <= value <= 1_000_000_000 for value in point)
-                for point in positions.values()
-            ):
-                raise CodeGraphError("Invalid node position in view-layout.json.")
-        return layouts
+        frames = data.get("frames", {})
+        if not self.valid_view_coordinates(layouts, 2) or not self.valid_view_coordinates(frames, 4):
+            raise CodeGraphError("Invalid geometry in view-layout.json.")
+        return layouts, frames
 
-    def save_view_positions(self, layout, positions):
+    @staticmethod
+    def valid_view_coordinates(by_layout, dimensions):
+        return isinstance(by_layout, dict) and all(
+            isinstance(positions, dict) and all(
+                isinstance(point, list) and len(point) == dimensions
+                and all(type(value) in (int, float) and 0 <= value <= 1_000_000_000 for value in point)
+                and (dimensions == 2 or (point[0] < point[2] and point[1] < point[3]))
+                for point in positions.values()
+            )
+            for positions in by_layout.values()
+        )
+
+    def save_view_positions(self, layout, positions, *, frame=None):
         with self.database(write=True):
-            layouts = self.view_positions()
-            layouts.setdefault(layout, {}).update({node_id: list(point) for node_id, point in positions.items()})
-            atomic_write(self.home / "view-layout.json", json_text({"version": 1, "layouts": layouts}) + "\n")
+            layouts, frames = self.view_layout()
+            if positions:
+                layouts.setdefault(layout, {}).update({node_id: list(point) for node_id, point in positions.items()})
+            if frame:
+                name, bounds = frame
+                frames.setdefault(layout, {})[name] = list(bounds)
+            data = {"version": 1, "layouts": layouts, "frames": frames}
+            atomic_write(self.home / "view-layout.json", json_text(data) + "\n")
 
     @staticmethod
     def get_file(db, path):

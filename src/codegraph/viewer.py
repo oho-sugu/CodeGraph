@@ -248,6 +248,8 @@ class Viewer:
         self.callers_legend.pack(side="left", padx=(0, 12))
         self.callees_legend = ttk.Label(legend, textvariable=self.callees_label)
         self.callees_legend.pack(side="left")
+        self.selection_label = tk.StringVar()
+        ttk.Label(legend, textvariable=self.selection_label).pack(side="left", padx=(12, 0))
         self.io_summary = tk.StringVar()
         ttk.Label(legend, textvariable=self.io_summary).pack(side="left", padx=(12, 0))
         viewport = ttk.Frame(graph, padding=(6, 0, 6, 6))
@@ -256,6 +258,7 @@ class Viewer:
                                takefocus=True)
         self.scrollable(viewport, self.graph, ttk, horizontal=True)
         self.graph.bind("<ButtonPress-1>", self.start_graph_drag)
+        self.graph.bind("<Shift-ButtonPress-1>", lambda event: self.start_graph_drag(event, selecting=True))
         self.graph.bind("<B1-Motion>", self.drag_graph)
         self.graph.bind("<ButtonRelease-1>", self.end_graph_drag)
         self.graph.bind("<Button-2>", lambda event: self.graph.scan_mark(event.x, event.y))
@@ -274,6 +277,10 @@ class Viewer:
         self.focus_path = None
         self.focus_resource = None
         self.graph_nodes = {}
+        self.selected_nodes = set()
+        self.frame_bounds = {}
+        self.frame_items = {}
+        self.frame_grips = {}
         self.node_items = {}
         self.edge_items = {}
         self.io_items = {}
@@ -287,8 +294,13 @@ class Viewer:
         self.orphan_note = None
         self.drag_origin = None
         self.drag_positions = {}
+        self.drag_frame = None
+        self.drag_selecting = False
+        self.drag_hit_node = None
+        self.marquee = None
         self.dragging = False
         self.manual_positions = {}
+        self.manual_frames = {}
         self.layout_extent = (0, 0)
         self.viewport_states = {}
         self.view_key = self.current_view_key()
@@ -362,7 +374,7 @@ class Viewer:
             self.focus_resource = None
         layout_error = None
         try:
-            self.manual_positions = self.project.view_positions()
+            self.manual_positions, self.manual_frames = self.project.view_layout()
         except (CodeGraphError, OSError) as error:
             layout_error = str(error)
         self.load_notes()
@@ -404,6 +416,9 @@ class Viewer:
         overrides = self.manual_positions.get(self.layout_mode.get(), {})
         for node_id in positions.keys() & overrides.keys():
             positions[node_id] = tuple(overrides[node_id])
+        boxes = self.manual_frames.get(self.layout_mode.get(), {})
+        self.frame_bounds = {name: tuple(boxes.get(name, bounds)) for name, *bounds in groups}
+        self.selected_nodes.intersection_update(positions)
         self.expand_layout()
 
     def expand_layout(self):
@@ -412,6 +427,9 @@ class Viewer:
         for x, y in positions.values():
             width = max(width, x + NODE_WIDTH / 2 + 26)
             height = max(height, y + NODE_HEIGHT / 2 + 26)
+        for _, _, right, bottom in self.frame_bounds.values():
+            width = max(width, right + 18)
+            height = max(height, bottom + 18)
         self.layout = groups, positions, (width, height)
 
     def current_view_key(self):
@@ -508,6 +526,7 @@ class Viewer:
         self.focus_id = None
         self.focus_path = None
         self.focus_resource = None
+        self.selected_nodes.clear()
         self.orphan_note = orphan_note
         self.symbols.selection_remove(*self.symbols.selection())
         self.file_tree.selection_remove(*self.file_tree.selection())
@@ -590,6 +609,13 @@ class Viewer:
 
     def file_member_ids(self, path):
         return [node["id"] for node in self.nodes if node["source_ref"]["path"] == path]
+
+    def frame_member_ids(self, name):
+        if name == "Tables":
+            return [item["id"] for item in self.resources.values() if item["kind"] == "table"]
+        if name == "Files and handles":
+            return [item["id"] for item in self.resources.values() if item["kind"] != "table"]
+        return self.file_member_ids(name)
 
     def render_selection(self):
         self.highlight_graph()
@@ -812,51 +838,119 @@ class Viewer:
                 canvas.yview_moveto((canvas.canvasy(0) + dy) / (height * self.scale))
         return "break"
 
-    def start_graph_drag(self, event):
+    def start_graph_drag(self, event, *, selecting=False):
         self.graph.focus_set()
         self.drag_origin = event.x, event.y
         current = self.graph.find_withtag("current")
-        node_id = self.graph_nodes.get(current[0]) if current else None
-        members = self.file_member_ids(self.focus_path) if self.focus_path else []
-        drag_ids = [node_id] if node_id else []
-        if node_id in members:
-            drag_ids = members
+        hit = current[0] if current else None
+        self.drag_hit_node = node_id = self.graph_nodes.get(hit)
+        self.drag_selecting = selecting
+        self.drag_frame = None
+        drag_ids = []
+        grip = self.frame_grips.get(hit)
+        if not selecting and grip:
+            name, resize = grip
+            self.drag_frame = name, resize, self.frame_bounds[name]
+            if not resize:
+                drag_ids = self.frame_member_ids(name)
+        elif not selecting and node_id:
+            members = self.file_member_ids(self.focus_path) if self.focus_path else []
+            if node_id in self.selected_nodes:
+                drag_ids = self.selected_nodes
+            elif node_id in members:
+                drag_ids = members
+            else:
+                drag_ids = [node_id]
         self.drag_positions = {node_id: self.layout[1][node_id] for node_id in drag_ids}
         self.dragging = False
-        self.graph.scan_mark(event.x, event.y)
+        if not (selecting or self.drag_frame or self.drag_positions):
+            self.graph.scan_mark(event.x, event.y)
 
     def drag_graph(self, event):
-        if self.drag_origin:
-            x, y = self.drag_origin
-            if self.dragging or max(abs(event.x - x), abs(event.y - y)) >= 4:
-                self.dragging = True
-                if not self.drag_positions:
-                    self.graph.scan_dragto(event.x, event.y, gain=1)
-                else:
-                    left = min(point[0] for point in self.drag_positions.values())
-                    top = min(point[1] for point in self.drag_positions.values())
-                    dx = max(NODE_WIDTH / 2 + 18 - left, (event.x - x) / self.scale)
-                    dy = max(NODE_HEIGHT / 2 + 18 - top, (event.y - y) / self.scale)
-                    self.move_nodes({node_id: (x + dx, y + dy)
-                                     for node_id, (x, y) in self.drag_positions.items()})
+        if not self.drag_origin:
+            return
+        x, y = self.drag_origin
+        dx, dy = event.x - x, event.y - y
+        if not self.dragging and max(abs(dx), abs(dy)) < 4:
+            return
+        self.dragging = True
+        if self.drag_selecting:
+            self.draw_marquee(event)
+        elif self.drag_frame or self.drag_positions:
+            self.translate_drag(dx / self.scale, dy / self.scale)
+        else:
+            self.graph.scan_dragto(event.x, event.y, gain=1)
+
+    def translate_drag(self, dx, dy):
+        lefts = [x - NODE_WIDTH / 2 for x, _ in self.drag_positions.values()]
+        tops = [y - NODE_HEIGHT / 2 for _, y in self.drag_positions.values()]
+        if self.drag_frame:
+            name, resize, (left, top, right, bottom) = self.drag_frame
+            if resize:
+                self.frame_bounds[name] = (left, top, max(left + 62, right + dx), max(top + 46, bottom + dy))
+                self.place_frame(name)
+                self.resize_scroll_region()
+                return
+            lefts.append(left)
+            tops.append(top)
+        dx, dy = max(18 - min(lefts), dx), max(18 - min(tops), dy)
+        if self.drag_frame:
+            self.frame_bounds[name] = (left + dx, top + dy, right + dx, bottom + dy)
+            self.place_frame(name)
+        self.move_nodes({node_id: (x + dx, y + dy) for node_id, (x, y) in self.drag_positions.items()})
 
     def end_graph_drag(self, event):
-        if self.drag_origin and not self.dragging:
+        if self.drag_selecting:
+            self.finish_selection()
+        elif self.drag_origin and not self.dragging and not self.drag_frame:
             self.graph_clicked(event)
         moved = {node_id: self.layout[1][node_id] for node_id, point in self.drag_positions.items()
                  if self.layout[1][node_id] != point}
-        if moved:
+        frame = None
+        if self.drag_frame:
+            name, _, original = self.drag_frame
+            if self.frame_bounds[name] != original:
+                frame = name, self.frame_bounds[name]
+        if moved or frame:
             mode = self.layout_mode.get()
             try:
-                self.project.save_view_positions(mode, moved)
+                self.project.save_view_positions(mode, moved, frame=frame)
                 self.manual_positions.setdefault(mode, {}).update(
                     {node_id: list(point) for node_id, point in moved.items()}
                 )
+                if frame:
+                    self.manual_frames.setdefault(mode, {})[frame[0]] = list(frame[1])
             except (CodeGraphError, OSError, sqlite3.Error) as error:
-                self.status.set(f"Could not save node positions: {error}")
+                self.status.set(f"Could not save layout: {error}")
             self.restore_viewport(self.viewport())
         self.drag_origin = None
         self.drag_positions = {}
+        self.drag_frame = None
+        self.drag_selecting = False
+        self.drag_hit_node = None
+
+    def draw_marquee(self, event):
+        canvas = self.graph
+        x, y = self.drag_origin
+        left, right = sorted((canvas.canvasx(x), canvas.canvasx(event.x)))
+        top, bottom = sorted((canvas.canvasy(y), canvas.canvasy(event.y)))
+        if self.marquee is None:
+            self.marquee = canvas.create_rectangle(left, top, right, bottom, dash=(4, 2),
+                                                  outline=self.COLORS["selection_border"], width=2)
+        else:
+            canvas.coords(self.marquee, left, top, right, bottom)
+
+    def finish_selection(self):
+        if self.marquee is not None:
+            coords = self.graph.coords(self.marquee)
+            if coords:
+                items = self.graph.find_overlapping(*coords)
+                self.selected_nodes.update(self.graph_nodes[item] for item in items if item in self.graph_nodes)
+            self.graph.delete(self.marquee)
+            self.marquee = None
+        elif self.drag_hit_node:
+            self.selected_nodes.symmetric_difference_update((self.drag_hit_node,))
+        self.highlight_graph()
 
     def move_nodes(self, moved):
         canvas, scale = self.graph, self.scale
@@ -868,13 +962,16 @@ class Viewer:
             marker = (self.note_markers[node_id],) if node_id in self.note_markers else ()
             for item in (*items[node_id], *marker):
                 canvas.move(item, (point[0] - old_x) * scale, (point[1] - old_y) * scale)
-        self.fitting = False
-        self.expand_layout()
-        width, height = self.layout[2]
-        canvas.configure(scrollregion=(0, 0, width * scale, height * scale))
+        self.resize_scroll_region()
         self.move_edges(moved.keys(), self.edges, self.edge_items)
         if self.io_enabled.get():
             self.move_edges(moved.keys(), self.io["edges"], self.io_items, with_labels=True)
+
+    def resize_scroll_region(self):
+        self.fitting = False
+        self.expand_layout()
+        width, height = self.layout[2]
+        self.graph.configure(scrollregion=(0, 0, width * self.scale, height * self.scale))
 
     def move_edges(self, node_ids, edges, items, *, with_labels=False):
         positions = self.layout[1]
@@ -923,9 +1020,12 @@ class Viewer:
 
     def draw_graph(self):
         canvas, colors = self.graph, self.COLORS
-        groups, positions, (width, height) = self.layout
+        _, positions, (width, height) = self.layout
         scale = self.scale
         canvas.delete("all")
+        self.marquee = None
+        self.frame_items.clear()
+        self.frame_grips.clear()
         self.graph_nodes.clear()
         self.node_items.clear()
         self.edge_items.clear()
@@ -935,13 +1035,16 @@ class Viewer:
         canvas.configure(scrollregion=(0, 0, width * scale, height * scale))
         label_font = ("Segoe UI", -max(6, round(12 * scale)))
         title_font = ("Segoe UI", -max(7, round(12 * scale)), "bold")
-        for path, x1, y1, x2, y2 in groups:
-            canvas.create_rectangle(x1 * scale, y1 * scale, x2 * scale, y2 * scale,
-                                    fill=colors["group"], outline=colors["muted_line"])
-            if scale >= 0.28:
-                title = path if len(path) <= 25 else "…" + path[-24:]
-                canvas.create_text((x1 + 10) * scale, (y1 + 15) * scale, anchor="w",
-                                   text=title, font=title_font, fill=colors["ink"])
+        for name in self.frame_bounds:
+            box = canvas.create_rectangle(0, 0, 0, 0, fill=colors["group"], outline=colors["muted_line"])
+            header = canvas.create_rectangle(0, 0, 0, 0, fill=colors["group"], outline=colors["border"],
+                                             tags="frame_grips")
+            title = canvas.create_text(0, 0, anchor="w", font=title_font, fill=colors["ink"],
+                                       tags="frame_grips")
+            handle = canvas.create_rectangle(0, 0, 0, 0, fill=colors["border"], outline="", tags="frame_grips")
+            self.frame_items[name] = box, header, title, handle
+            self.frame_grips.update({header: (name, False), title: (name, False), handle: (name, True)})
+            self.place_frame(name)
         ports = edge_ports(self.edges, positions)
         for edge in self.edges:
             points = edge_path(positions[edge["from_id"]], positions[edge["to_id"]], ports[edge["id"]])
@@ -986,6 +1089,21 @@ class Viewer:
         if self.io_enabled.get():
             self.draw_io(positions, label_font)
         self.highlight_graph()
+
+    def place_frame(self, name):
+        canvas, scale = self.graph, self.scale
+        left, top, right, bottom = (coordinate * scale for coordinate in self.frame_bounds[name])
+        box, header, title, handle = self.frame_items[name]
+        header_height = max(8, 26 * scale)
+        grip_size = max(6, 10 * scale)
+        canvas.coords(box, left, top, right, bottom)
+        canvas.coords(header, left, top, right, top + header_height)
+        canvas.coords(title, left + 10 * scale, top + header_height / 2)
+        max_chars = max(1, int((right - left - 16 * scale) / max(4, 7 * scale)))
+        if len(name) > max_chars:
+            name = "…" + name[len(name) - max_chars + 1:]
+        canvas.itemconfigure(title, text=name, state="normal" if scale >= 0.28 else "hidden")
+        canvas.coords(handle, right - grip_size, bottom - grip_size, right, bottom)
 
     def draw_io(self, positions, font):
         canvas, scale = self.graph, self.scale
@@ -1035,10 +1153,12 @@ class Viewer:
                 canvas.tag_raise(line)
                 canvas.tag_raise(label)
         for resource_id, (box, label) in self.resource_items.items():
-            active = resource_id in related or resource_id == self.focus_resource
+            selected = resource_id in self.selected_nodes
+            active = selected or resource_id in related or resource_id == self.focus_resource
             visible = active or not has_focus
+            border = "selection_border" if selected else "io_read" if visible else "muted_line"
             canvas.itemconfigure(box, fill=colors["io_fill" if visible else "muted_fill"],
-                                 outline=colors["io_read" if visible else "muted_line"])
+                                 outline=colors[border], width=max(2, 2.5 * self.scale) if selected else 1)
             canvas.itemconfigure(label, fill=colors["ink" if visible else "muted_ink"])
             if active:
                 canvas.tag_raise(box)
@@ -1089,6 +1209,7 @@ class Viewer:
             self.callees_label.set(f"Callees · {len(callees)}" if self.focus_id else "Callees")
         io_neighbors = self.highlight_io(file_nodes, has_focus)
         for node_id, (box, label) in self.node_items.items():
+            selected = node_id in self.selected_nodes
             if node_id == self.focus_id:
                 fill, border, ink = ("selected", "accent", "selected_ink")
             elif node_id in callers and node_id in callees:
@@ -1099,19 +1220,26 @@ class Viewer:
                 fill, border, ink = ("related", "accent", "ink")
             elif node_id in io_neighbors:
                 fill, border, ink = ("io_fill", "io_read", "ink")
-            elif has_focus:
+            elif has_focus and not selected:
                 fill, border, ink = ("muted_fill", "muted_line", "muted_ink")
             else:
                 fill, border, ink = ("surface", "border", "ink")
-            canvas.itemconfigure(box, fill=colors[fill], outline=colors[border])
+            canvas.itemconfigure(box, fill=colors[fill], outline=colors["selection_border" if selected else border],
+                                 width=max(2, 2.5 * self.scale) if selected else 1)
             canvas.itemconfigure(label, fill=colors[ink])
-            if node_id == self.focus_id or any(node_id in group for group in (callers, callees, file_nodes, io_neighbors)):
+            if selected or node_id == self.focus_id or any(
+                node_id in group for group in (callers, callees, file_nodes, io_neighbors)
+            ):
                 canvas.tag_raise(box)
                 canvas.tag_raise(label)
                 if node_id in self.note_markers:
                     canvas.tag_raise(self.note_markers[node_id])
+        canvas.tag_raise("frame_grips")
+        self.selection_label.set(f"{len(self.selected_nodes)} selected" if self.selected_nodes else "")
 
     def graph_clicked(self, _event):
+        had_selection = bool(self.selected_nodes)
+        self.selected_nodes.clear()
         current = self.graph.find_withtag("current")
         if current:
             node_id = self.graph_nodes.get(current[0])
@@ -1120,3 +1248,6 @@ class Viewer:
                     self.select_resource(node_id)
                 else:
                     self.select_symbol(node_id)
+                return
+        if had_selection:
+            self.highlight_graph()
