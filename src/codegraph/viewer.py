@@ -286,8 +286,7 @@ class Viewer:
         self.note_target = None
         self.orphan_note = None
         self.drag_origin = None
-        self.drag_node = None
-        self.drag_position = None
+        self.drag_positions = {}
         self.dragging = False
         self.manual_positions = {}
         self.layout_extent = (0, 0)
@@ -585,9 +584,12 @@ class Viewer:
             self.file_tree.selection_set(path)
         self.file_tree.see(path)
         self.render_selection()
-        members = [node["id"] for node in self.nodes if node["source_ref"]["path"] == path]
+        members = self.file_member_ids(path)
         if members:
             self.reveal_node(members[0])
+
+    def file_member_ids(self, path):
+        return [node["id"] for node in self.nodes if node["source_ref"]["path"] == path]
 
     def render_selection(self):
         self.highlight_graph()
@@ -814,8 +816,12 @@ class Viewer:
         self.graph.focus_set()
         self.drag_origin = event.x, event.y
         current = self.graph.find_withtag("current")
-        self.drag_node = self.graph_nodes.get(current[0]) if current else None
-        self.drag_position = self.layout[1].get(self.drag_node)
+        node_id = self.graph_nodes.get(current[0]) if current else None
+        members = self.file_member_ids(self.focus_path) if self.focus_path else []
+        drag_ids = [node_id] if node_id else []
+        if node_id in members:
+            drag_ids = members
+        self.drag_positions = {node_id: self.layout[1][node_id] for node_id in drag_ids}
         self.dragging = False
         self.graph.scan_mark(event.x, event.y)
 
@@ -824,53 +830,58 @@ class Viewer:
             x, y = self.drag_origin
             if self.dragging or max(abs(event.x - x), abs(event.y - y)) >= 4:
                 self.dragging = True
-                if self.drag_node is None:
+                if not self.drag_positions:
                     self.graph.scan_dragto(event.x, event.y, gain=1)
                 else:
-                    start_x, start_y = self.drag_position
-                    point = (max(NODE_WIDTH / 2 + 18, start_x + (event.x - x) / self.scale),
-                             max(NODE_HEIGHT / 2 + 18, start_y + (event.y - y) / self.scale))
-                    self.move_node(self.drag_node, point)
+                    left = min(point[0] for point in self.drag_positions.values())
+                    top = min(point[1] for point in self.drag_positions.values())
+                    dx = max(NODE_WIDTH / 2 + 18 - left, (event.x - x) / self.scale)
+                    dy = max(NODE_HEIGHT / 2 + 18 - top, (event.y - y) / self.scale)
+                    self.move_nodes({node_id: (x + dx, y + dy)
+                                     for node_id, (x, y) in self.drag_positions.items()})
 
     def end_graph_drag(self, event):
         if self.drag_origin and not self.dragging:
             self.graph_clicked(event)
-        elif self.drag_node and self.layout[1][self.drag_node] != self.drag_position:
-            point = self.layout[1][self.drag_node]
+        moved = {node_id: self.layout[1][node_id] for node_id, point in self.drag_positions.items()
+                 if self.layout[1][node_id] != point}
+        if moved:
             mode = self.layout_mode.get()
             try:
-                self.project.save_view_position(mode, self.drag_node, point)
-                self.manual_positions.setdefault(mode, {})[self.drag_node] = list(point)
+                self.project.save_view_positions(mode, moved)
+                self.manual_positions.setdefault(mode, {}).update(
+                    {node_id: list(point) for node_id, point in moved.items()}
+                )
             except (CodeGraphError, OSError, sqlite3.Error) as error:
-                self.status.set(f"Could not save node position: {error}")
+                self.status.set(f"Could not save node positions: {error}")
             self.restore_viewport(self.viewport())
         self.drag_origin = None
-        self.drag_node = None
-        self.drag_position = None
+        self.drag_positions = {}
 
-    def move_node(self, node_id, point):
+    def move_nodes(self, moved):
         canvas, scale = self.graph, self.scale
         positions = self.layout[1]
-        old_x, old_y = positions[node_id]
-        positions[node_id] = point
+        for node_id, point in moved.items():
+            old_x, old_y = positions[node_id]
+            positions[node_id] = point
+            items = self.node_items if node_id in self.node_items else self.resource_items
+            marker = (self.note_markers[node_id],) if node_id in self.note_markers else ()
+            for item in (*items[node_id], *marker):
+                canvas.move(item, (point[0] - old_x) * scale, (point[1] - old_y) * scale)
         self.fitting = False
         self.expand_layout()
         width, height = self.layout[2]
         canvas.configure(scrollregion=(0, 0, width * scale, height * scale))
-        items = self.node_items if node_id in self.node_items else self.resource_items
-        marker = (self.note_markers[node_id],) if node_id in self.note_markers else ()
-        for item in (*items[node_id], *marker):
-            canvas.move(item, (point[0] - old_x) * scale, (point[1] - old_y) * scale)
-        self.move_edges(node_id, self.edges, self.edge_items)
+        self.move_edges(moved.keys(), self.edges, self.edge_items)
         if self.io_enabled.get():
-            self.move_edges(node_id, self.io["edges"], self.io_items, with_labels=True)
+            self.move_edges(moved.keys(), self.io["edges"], self.io_items, with_labels=True)
 
-    def move_edges(self, node_id, edges, items, *, with_labels=False):
+    def move_edges(self, node_ids, edges, items, *, with_labels=False):
         positions = self.layout[1]
         ports = edge_ports(edges, positions)
         for edge in edges:
             start, end = edge["from_id"], edge["to_id"]
-            if node_id not in (start, end):
+            if start not in node_ids and end not in node_ids:
                 continue
             points = edge_path(positions[start], positions[end], ports[edge["id"]])
             item = items[edge["id"]]
@@ -1046,10 +1057,7 @@ class Viewer:
 
     def highlight_graph(self):
         canvas, colors = self.graph, self.COLORS
-        file_nodes = {
-            node["id"] for node in self.nodes
-            if self.focus_path and node["source_ref"]["path"] == self.focus_path
-        }
+        file_nodes = set(self.file_member_ids(self.focus_path)) if self.focus_path else set()
         has_focus = bool(self.focus_id or file_nodes or self.focus_resource)
         callers, callees = set(), set()
         canvas.tag_raise("edges")

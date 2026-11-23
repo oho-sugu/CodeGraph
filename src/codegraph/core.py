@@ -535,10 +535,10 @@ class Project:
                 raise CodeGraphError("Invalid node position in view-layout.json.")
         return layouts
 
-    def save_view_position(self, layout, node_id, point):
+    def save_view_positions(self, layout, positions):
         with self.database(write=True):
             layouts = self.view_positions()
-            layouts.setdefault(layout, {})[node_id] = list(point)
+            layouts.setdefault(layout, {}).update({node_id: list(point) for node_id, point in positions.items()})
             atomic_write(self.home / "view-layout.json", json_text({"version": 1, "layouts": layouts}) + "\n")
 
     @staticmethod

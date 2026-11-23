@@ -791,6 +791,34 @@ class Store:
         finally:
             reopened.destroy()
 
+        viewer.select_file("src/app.py")
+        file_members = {item["id"] for item in graph["nodes"] if item["source_ref"]["path"] == "src/app.py"}
+        previous = dict(viewer.layout[1])
+        box, _ = viewer.node_items[node["id"]]
+        with patch.object(viewer.graph, "find_withtag", return_value=(box,)):
+            viewer.start_graph_drag(start)
+        group_end = SimpleNamespace(x=-980, y=115)
+        viewer.drag_graph(group_end)
+        with patch.object(viewer.project, "save_view_positions", wraps=viewer.project.save_view_positions) as save:
+            viewer.end_graph_drag(group_end)
+        save.assert_called_once()
+        dx, dy = (new - old for new, old in zip(viewer.layout[1][node["id"]], previous[node["id"]]))
+        self.assertGreater(dy, 0)
+        for node_id, (x, y) in previous.items():
+            expected = (x + dx, y + dy) if node_id in file_members else (x, y)
+            for actual, coordinate in zip(viewer.layout[1][node_id], expected):
+                self.assertAlmostEqual(actual, coordinate)
+        saved_group = {node_id: viewer.layout[1][node_id] for node_id in file_members}
+        self.assertEqual(self.project.call_graph()["edges"], original_edges)
+        self.assertEqual(viewer.focus_path, "src/app.py")
+        reopened = tk.Toplevel(window)
+        reopened.withdraw()
+        try:
+            reloaded = Viewer(reopened, self.project, tk, ttk)
+            self.assertEqual({node_id: reloaded.layout[1][node_id] for node_id in file_members}, saved_group)
+        finally:
+            reopened.destroy()
+
         window.attributes("-alpha", 0)
         window.deiconify()
         window.update()
