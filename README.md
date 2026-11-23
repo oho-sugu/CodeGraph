@@ -47,50 +47,72 @@ uv run --locked cg --project $project inspect --annotations --format json
 
 `search` は名前、完全修飾名、パス、対象ノードが残っている注釈の本文を検索します。`status` が `unbuilt` または `stale` のときは、`cg update` でソースからグラフを更新できます。同じ内容の構文エラーが残っている場合、更新済みの状態と診断が両方返ります。
 
-このリポジトリには Codex 用の [CodeGraph Skill](.agents/skills/codegraph/SKILL.md) が含まれます。別の対象リポジトリで使う場合は、そのリポジトリの `.agents/skills/` に `codegraph` ディレクトリを配置し、対象を `cg --project` で指定できます。
-
 ソース座標は行・列ともに 1 始まりで、範囲の終点はその文字を含みません。`analyze` の JSON にはファイル別診断が含まれ、構文エラーのあるファイルの前回のシンボルには `stale` が付きます。解決できなかった呼び出しは `inspect` の `unresolved_calls` に、同一クラスの `self.method()` は `INFERRED` の参照に現れます。
 
 プロジェクト内の単純なクラスについては、コンストラクター、戻り値の型注釈、引数の型注釈からローカル変数や `self` の属性の型を追います。これらのレシーバー経由の呼び出しも `INFERRED` になります。
 
 `.codegraph/annotations/annotations.jsonl` に注釈の正本を保存します。注釈対象の変更や削除は、再解析後に `NEEDS_REVIEW` または `ORPHANED` として確認できます。`graph.db` を再構築するときは `cg analyze` を実行します。
 
-## I/O の取り込み
+## 別のプロジェクトを解析する
 
-Agent は SQL、ORM、ファイル操作のコードを読み、実際に操作する関数・メソッドの ID と根拠行を調べます。`cg search` や `cg inspect` で ID を取得できます。ソースファイルごとに次の JSON を一つ作ります。`inputs` には調査に使った各ファイルの内容から計算した小文字の SHA-256 を入れます。パスはすべて対象プロジェクトからの相対パスで、区切りは `/` です。
+CodeGraph のチェックアウトと、解析したい Python プロジェクトの絶対パスを指定します。次の PowerShell コマンドはどちらのディレクトリからでも実行できます。
 
-```json
-{
-  "version": 1,
-  "source": "src/repository.py",
-  "inputs": {
-    "src/repository.py": "<SHA-256>",
-    "migrations/001_orders.sql": "<SHA-256>"
-  },
-  "accesses": [
-    {
-      "node_id": "<cg が返したメソッド ID>",
-      "operation": "READS",
-      "line": 12,
-      "resource": {
-        "kind": "table",
-        "database": "app",
-        "schema": "main",
-        "name": "orders",
-        "definition": {"path": "migrations/001_orders.sql", "line": 1}
-      }
-    }
-  ]
+```powershell
+$codegraph = 'C:\tools\CodeGraph'
+$project = 'C:\work\my-python-project'
+
+uv sync --locked --project $codegraph
+uv run --locked --project $codegraph cg --project $project init
+uv run --locked --project $codegraph cg --project $project analyze
+uv run --locked --project $codegraph cg --project $project search '関数名' --format json
+uv run --locked --project $codegraph cg --project $project view
+```
+
+- `uv` の `--project $codegraph` は、CodeGraph を実行する環境を指定します。
+- `cg` の `--project $project` は、解析対象と `.codegraph/` の保存先を指定します。
+- 対象プロジェクトの Python コードが `src/` 以下にある場合は、初回の `init` に `--source-root src` を付けます。ソースを編集した後は `uv run --locked --project $codegraph cg --project $project update` を実行し、Viewer の **Refresh graph** を押します。
+
+### 対象プロジェクトに Skill を配置する
+
+対象プロジェクトの `.agents/skills/` に、CodeGraph の `codegraph/` ディレクトリを丸ごとコピーします。
+
+```powershell
+$skills = Join-Path $project '.agents/skills'
+New-Item -ItemType Directory -Force -Path $skills | Out-Null
+if (-not (Test-Path -LiteralPath (Join-Path $skills 'codegraph'))) {
+    Copy-Item -LiteralPath (Join-Path $codegraph '.agents/skills/codegraph') -Destination $skills -Recurse
 }
 ```
 
-- 操作は `READS` または `WRITES` です。確定したファイルは `{"kind": "file", "path": "exports/orders.csv"}` で表します。
-- 実行時にパスが決まるファイルは `{"kind": "handle", "anchor": {"kind": "parameter", "node_id": "<所有メソッド ID>", "name": "sink"}}` のように指定できます。開く箇所を使う場合は `anchor` の `kind` を `open` にし、`name` の代わりに 1 始まりの `line` と `column` を指定します。同じハンドルを渡していることが根拠から分かる場合は、別メソッドから同じアンカーを参照できます。
-- テーブルの `definition` は任意です。対象を特定できないときは `resource: null` と `reason` を記録します。
+コピー先は `.agents/skills/codegraph/SKILL.md` と `.agents/skills/codegraph/references/io-format.md` です。同名の Skill がすでにある場合は、差分を確認して更新します。対象プロジェクトを Codex で開き、以下の呼び出し方を使います。
+
+## Codex で CodeGraph Skill を使う
+
+Codex の入力欄で `$codegraph` に続けて依頼を書きます。このリポジトリでは、たとえば `$codegraph Project.analyze の呼び出し元と根拠行を調べて` と入力します。 [CodeGraph Skill](.agents/skills/codegraph/SKILL.md)
+
+### ファイル・DB の I/O を解析させる
+
+Codex の入力欄に次を貼り付けます。
+
+```text
+$codegraph reveal file and database i/o
+```
+
+対象を絞るときは、たとえば `$codegraph src/repository.py のファイルと DB の入出力を解析し、結果を CodeGraph に取り込んで` と依頼します。Skill はグラフの状態を確認して、直接読み書きする関数・メソッドと根拠行を探し、ソースファイル単位の JSON を生成して `cg import-io` で登録します。
+
+別のプロジェクトで `cg` が PATH にない場合は、Codex への依頼に CodeGraph のチェックアウトの絶対パスを添えます。たとえば「CodeGraph は `C:\tools\CodeGraph` にあります。CLI は `uv run --locked --project C:\tools\CodeGraph cg --project C:\work\my-python-project` で実行してください」と伝えます。
+
+完了したら、開いている Viewer で **Refresh graph** を押し、**I/O** をオンにします。リソースを選ぶとアクセス元と根拠行が見えます。CLI で確認する場合は `uv run --locked --project $codegraph cg --project $project io --format json` を実行します。取り込み済みの JSON は対象プロジェクトの `.codegraph/facts/` にあります。
+
+## I/O の取り込み形式
+
+JSON の項目と例は、Skill に同梱した [I/O 出力形式 v1](.agents/skills/codegraph/references/io-format.md) にあります。ソースファイルごとに、読み書きするシンボルの ID、根拠行、操作対象、参照したファイルのハッシュを記録します。
+
+JSON を手元で作成した場合は、次のコマンドで登録・確認できます。
 
 ```powershell
-uv run --locked cg --project $project import-io .\agent-output.json --format json
-uv run --locked cg --project $project io --format json
+uv run --locked --project $codegraph cg --project $project import-io .\agent-output.json --format json
+uv run --locked --project $codegraph cg --project $project io --format json
 ```
 
 取り込みは同じソースファイルの既存文書をまとめて置き換えます。`accesses: []` でそのファイルの古い I/O 関係を外せます。取り込んだ JSON は対象プロジェクトの `.codegraph/facts/` に保存されます。入力が変更された文書は `cg io` に `STALE` と表示され、更新済みの文書を再取り込みすると辺が戻ります。
