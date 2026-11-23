@@ -755,3 +755,109 @@ class Store:
         viewer.change_layout()
         self.assertFalse(viewer.resource_items)
         self.assertIsNone(viewer.focus_resource)
+
+        from types import SimpleNamespace
+        from tkinter import ttk
+
+        viewer.layout_mode.set("Hierarchy")
+        viewer.change_layout()
+        original_position = viewer.layout[1][node["id"]]
+        original_edges = self.project.call_graph()["edges"]
+        box, _ = viewer.node_items[node["id"]]
+        start = SimpleNamespace(x=20, y=30)
+        end = SimpleNamespace(x=70, y=95)
+        with patch.object(viewer.graph, "find_withtag", return_value=(box,)):
+            viewer.start_graph_drag(start)
+        viewer.drag_graph(end)
+        viewer.end_graph_drag(end)
+        moved = viewer.layout[1][node["id"]]
+        self.assertNotEqual(moved, original_position)
+        self.assertEqual(self.project.view_positions(), {"Hierarchy": {node["id"]: list(moved)}})
+        self.assertEqual(self.project.call_graph()["edges"], original_edges)
+        viewer.refresh()
+        self.assertEqual(viewer.layout[1][node["id"]], moved)
+        viewer.layout_mode.set("By file")
+        viewer.change_layout()
+        self.assertNotEqual(viewer.layout[1][node["id"]], moved)
+        viewer.layout_mode.set("Hierarchy")
+        viewer.change_layout()
+        self.assertEqual(viewer.layout[1][node["id"]], moved)
+        reopened = tk.Toplevel(window)
+        reopened.withdraw()
+        try:
+            reloaded = Viewer(reopened, self.project, tk, ttk)
+            self.assertEqual(reloaded.layout[1][node["id"]], moved)
+            self.assertTrue(reloaded.fitting)
+        finally:
+            reopened.destroy()
+
+        window.attributes("-alpha", 0)
+        window.deiconify()
+        window.update()
+        viewer.sidebar.select(viewer.sidebar.tabs()[0])
+        window.update()
+        viewer.zoom(10)
+        viewer.graph.xview_moveto(0.2)
+        viewer.graph.yview_moveto(0.2)
+        start_view = viewer.viewport()
+        viewer.sidebar.select(viewer.files_tab)
+        window.update()
+        viewer.fit_graph()
+        viewer.sidebar.select(viewer.sidebar.tabs()[0])
+        window.update()
+        restored = viewer.viewport()
+        self.assertEqual(restored[:2], start_view[:2])
+        for position, expected in zip(restored[2:], start_view[2:]):
+            self.assertAlmostEqual(position, expected, delta=1)
+
+        browser = viewer.notes_browser
+        viewer.sidebar.select(browser)
+        window.update()
+        browser.query.set("APP.WORKER.EXECUTE")
+        self.assertEqual(browser.tree.get_children(), (annotation["id"],))
+        browser.open_first(None)
+        self.assertEqual(viewer.focus_id, node["id"])
+        self.assertTrue(viewer.source.tag_ranges("focus"))
+        self.assertTrue(browser.edit_button.instate(["!disabled"]))
+        with self.assertRaisesRegex(CodeGraphError, "note changed"):
+            self.project.change_annotation(annotation["id"], "Different text", expected_text="Old text")
+
+        browser.edit_button.invoke()
+        dialog = next(child for child in window.winfo_children() if isinstance(child, tk.Toplevel))
+        contents = dialog.winfo_children()[0].winfo_children()
+        editor = next(child for child in contents if isinstance(child, tk.Text))
+        self.assertEqual(editor.get("1.0", "end-1c"), annotation["text"])
+        editor.delete("1.0", "end")
+        editor.insert("1.0", "確認後のメモ")
+        save = next(button for button in contents[-1].winfo_children() if button.cget("text") == "Save note")
+        save.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        updated, = self.project.annotations()
+        self.assertEqual(updated, {**annotation, "text": "確認後のメモ"})
+        viewer.refresh()
+        browser.query.set("確認後")
+        self.assertEqual(browser.tree.get_children(), (annotation["id"],))
+        reopened = tk.Toplevel(window)
+        reopened.withdraw()
+        try:
+            reloaded = Viewer(reopened, self.project, tk, ttk)
+            self.assertEqual(reloaded.notes_browser.entries[annotation["id"]]["text"], "確認後のメモ")
+        finally:
+            reopened.destroy()
+
+        self.write("src/app.py", FIXTURES["app.py"].replace("def execute(", "def renamed("))
+        self.project.analyze()
+        viewer.refresh()
+        browser.query.set("ORPHANED")
+        self.assertEqual(browser.tree.get_children(), (annotation["id"],))
+        browser.open_first(None)
+        self.assertIsNone(viewer.focus_id)
+        self.assertIn("symbol for this note is missing", viewer.status.get())
+        self.assertIn("確認後のメモ", viewer.note_text.get("1.0", "end"))
+        with patch("tkinter.messagebox.askyesno", return_value=False):
+            browser.delete_button.invoke()
+        self.assertTrue(self.project.annotations())
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            browser.delete_button.invoke()
+        self.assertEqual(self.project.annotations(), [])
+        self.assertFalse(browser.tree.get_children())

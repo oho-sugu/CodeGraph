@@ -518,6 +518,29 @@ class Project:
         with self.database() as db:
             return self.live_source(path, self.get_file(db, path))
 
+    def view_positions(self):
+        path = self.home / "view-layout.json"
+        if not path.exists():
+            return {}
+        data = read_json(path)
+        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("layouts"), dict):
+            raise CodeGraphError("Invalid view-layout.json.")
+        layouts = data["layouts"]
+        for positions in layouts.values():
+            if not isinstance(positions, dict) or any(
+                not isinstance(point, list) or len(point) != 2
+                or any(type(value) not in (int, float) or not 0 <= value <= 1_000_000_000 for value in point)
+                for point in positions.values()
+            ):
+                raise CodeGraphError("Invalid node position in view-layout.json.")
+        return layouts
+
+    def save_view_position(self, layout, node_id, point):
+        with self.database(write=True):
+            layouts = self.view_positions()
+            layouts.setdefault(layout, {})[node_id] = list(point)
+            atomic_write(self.home / "view-layout.json", json_text({"version": 1, "layouts": layouts}) + "\n")
+
     @staticmethod
     def get_file(db, path):
         row = db.execute("SELECT payload FROM files WHERE path = ?", (path,)).fetchone()
@@ -577,6 +600,27 @@ class Project:
             nodes = self.payloads(db, "SELECT id, payload FROM nodes")
             return [self.annotation_state(item, nodes.get(item["target_node_id"])) for item in self.read_annotations()]
 
+    def change_annotation(self, annotation_id, body, *, expected_text=None):
+        """Replace an annotation's text, or remove it when body is None."""
+        if body is not None and not body.strip():
+            raise CodeGraphError("Enter some text for the note.")
+        with self.database(write=True):
+            annotations = {item["id"]: item for item in self.read_annotations()}
+            item = annotations.get(annotation_id)
+            if item is None:
+                raise CodeGraphError("This note no longer exists. Refresh the graph and try again.")
+            if expected_text is not None and item["text"] != expected_text:
+                raise CodeGraphError("This note changed. Refresh the graph before editing it.")
+            if body is None:
+                del annotations[annotation_id]
+            else:
+                annotations[annotation_id] = {**item, "text": body}
+            self.write_annotations(annotations.values())
+
+    def write_annotations(self, annotations):
+        ordered = sorted(annotations, key=lambda record: record["id"])
+        atomic_write(self.annotation_path, "".join(json_text(record) + "\n" for record in ordered))
+
     def annotate(self, node_id, kind, body, author=None):
         if kind not in ANNOTATION_TYPES or not body.strip():
             raise CodeGraphError("An annotation requires a supported type and non-empty text.")
@@ -590,6 +634,5 @@ class Project:
                 "id": str(uuid.uuid4()), "target_node_id": node_id, "type": kind, "text": body,
                 "author": author or getpass.getuser(), "created_at": now(), "source_hash": node["source_hash"],
             }
-            annotations = sorted([*self.read_annotations(), item], key=lambda record: record["id"])
-            atomic_write(self.annotation_path, "".join(json_text(record) + "\n" for record in annotations))
+            self.write_annotations([*self.read_annotations(), item])
             return self.annotation_state(item, node)

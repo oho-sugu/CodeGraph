@@ -141,6 +141,7 @@ def open_viewer(project: Project):
 class Viewer:
     def __init__(self, root, project: Project, tk, ttk):
         from tkinter.font import nametofont
+        from .note_editor import NotesBrowser
 
         self.project = project
         self.tk = tk
@@ -172,6 +173,8 @@ class Viewer:
         files = ttk.Frame(sidebar, padding=6)
         sidebar.add(symbols, text="Symbols")
         sidebar.add(files, text="Files")
+        self.notes_browser = NotesBrowser(sidebar, self.select_note, self.edit_note, self.delete_note)
+        sidebar.add(self.notes_browser, text="Notes")
         self.sidebar = sidebar
         self.files_tab = files
         graph = ttk.Labelframe(panes, text="Call graph")
@@ -281,8 +284,15 @@ class Viewer:
         self.notes_by_node = {}
         self.notes_error = None
         self.note_target = None
+        self.orphan_note = None
         self.drag_origin = None
+        self.drag_node = None
+        self.drag_position = None
         self.dragging = False
+        self.manual_positions = {}
+        self.layout_extent = (0, 0)
+        self.viewport_states = {}
+        self.view_key = self.current_view_key()
 
         self.source = tk.Text(
             source, font="TkFixedFont", width=42, wrap="none", state="disabled",
@@ -306,6 +316,7 @@ class Viewer:
         ttk.Label(main, textvariable=self.status).pack(fill="x", pady=(8, 0))
         self.query.trace_add("write", self.update_symbol_list)
         self.file_query.trace_add("write", self.update_file_list)
+        self.sidebar.bind("<<NotebookTabChanged>>", self.change_sidebar)
         self.apply_theme()
         self.refresh()
 
@@ -339,6 +350,7 @@ class Viewer:
             widget.configure(xscrollcommand=bottom.set)
 
     def refresh(self):
+        viewport = self.viewport()
         try:
             data = self.project.call_graph()
         except (CodeGraphError, OSError, sqlite3.Error) as error:
@@ -349,6 +361,11 @@ class Viewer:
         self.resources = {resource["id"]: resource for resource in self.io["resources"]}
         if self.focus_resource not in self.resources:
             self.focus_resource = None
+        layout_error = None
+        try:
+            self.manual_positions = self.project.view_positions()
+        except (CodeGraphError, OSError) as error:
+            layout_error = str(error)
         self.load_notes()
         self.update_layout()
         self.graph_summary.set(f"{len(self.nodes)} symbols · {len(self.edges)} calls")
@@ -358,11 +375,10 @@ class Viewer:
             self.focus_path = None
         self.update_symbol_list()
         self.update_file_list()
-        if self.fitting:
-            self.fit_graph()
-        else:
-            self.draw_graph()
+        self.restore_viewport(viewport)
         self.render_selection()
+        if layout_error:
+            self.status.set(layout_error)
 
     def update_layout(self):
         if self.layout_mode.get() == "Hierarchy":
@@ -385,13 +401,57 @@ class Viewer:
                     positions[item["id"]] = (left + NODE_WIDTH / 2 + 15, 66 + row * ROW_STEP)
                 width, height = left + NODE_WIDTH + 54, max(height, bottom + 18)
             self.layout = groups, positions, (width, height)
+        groups, positions, self.layout_extent = self.layout
+        overrides = self.manual_positions.get(self.layout_mode.get(), {})
+        for node_id in positions.keys() & overrides.keys():
+            positions[node_id] = tuple(overrides[node_id])
+        self.expand_layout()
+
+    def expand_layout(self):
+        groups, positions, _ = self.layout
+        width, height = self.layout_extent
+        for x, y in positions.values():
+            width = max(width, x + NODE_WIDTH / 2 + 26)
+            height = max(height, y + NODE_HEIGHT / 2 + 26)
+        self.layout = groups, positions, (width, height)
+
+    def current_view_key(self):
+        return self.layout_mode.get(), self.io_enabled.get(), self.sidebar.select()
+
+    def viewport(self):
+        return (self.scale, self.fitting, self.graph.canvasx(0) / self.scale,
+                self.graph.canvasy(0) / self.scale)
+
+    def restore_viewport(self, state):
+        if state is None or state[1]:
+            self.fit_graph()
+            return
+        self.scale, self.fitting, x, y = state
+        self.draw_graph()
+        width, height = self.layout[2]
+        if width and height:
+            self.graph.xview_moveto(x / width)
+            self.graph.yview_moveto(y / height)
+
+    def change_sidebar(self, _event):
+        key = self.current_view_key()
+        if key != self.view_key:
+            self.viewport_states[self.view_key] = self.viewport()
+            self.view_key = key
+            if key in self.viewport_states:
+                self.restore_viewport(self.viewport_states[key])
 
     def change_layout(self):
+        key = self.current_view_key()
+        if key == self.view_key:
+            return
+        self.viewport_states[self.view_key] = self.viewport()
+        self.view_key = key
         if not self.io_enabled.get() and self.focus_resource:
             self.focus_resource = None
             self.render_selection()
         self.update_layout()
-        self.fit_graph()
+        self.restore_viewport(self.viewport_states.get(key))
 
     def update_symbol_list(self, *_trace):
         query = self.query.get().strip().casefold()
@@ -420,7 +480,13 @@ class Viewer:
             self.symbols.see(self.focus_id)
 
     def focus_search(self, _event):
-        field = self.file_search if self.sidebar.select() == str(self.files_tab) else self.search
+        tab = self.sidebar.select()
+        if tab == str(self.notes_browser):
+            field = self.notes_browser.search
+        elif tab == str(self.files_tab):
+            field = self.file_search
+        else:
+            field = self.search
         field.focus_set()
         field.selection_range(0, "end")
         return "break"
@@ -439,10 +505,11 @@ class Viewer:
             self.select_symbol(matches[0])
         return "break"
 
-    def clear_focus(self):
+    def clear_focus(self, *, orphan_note=None):
         self.focus_id = None
         self.focus_path = None
         self.focus_resource = None
+        self.orphan_note = orphan_note
         self.symbols.selection_remove(*self.symbols.selection())
         self.file_tree.selection_remove(*self.file_tree.selection())
         self.render_selection()
@@ -456,6 +523,7 @@ class Viewer:
         self.focus_id = node_id
         self.focus_path = None
         self.focus_resource = None
+        self.orphan_note = None
         self.file_tree.selection_remove(*self.file_tree.selection())
         if self.symbols.exists(node_id):
             if self.symbols.selection() != (node_id,):
@@ -511,6 +579,7 @@ class Viewer:
     def select_file(self, path):
         self.focus_path, self.focus_id = path, None
         self.focus_resource = None
+        self.orphan_note = None
         self.symbols.selection_remove(*self.symbols.selection())
         if self.file_tree.selection() != (path,):
             self.file_tree.selection_set(path)
@@ -528,8 +597,11 @@ class Viewer:
             return
         if not (self.focus_id or self.focus_path):
             self.show_source("", None)
-            self.status.set("Select a function or method to see its calls and source." if self.nodes
-                            else "Run cg analyze to add Python functions and methods.")
+            if self.orphan_note:
+                self.status.set("The symbol for this note is missing.")
+            else:
+                self.status.set("Select a function or method to see its calls and source." if self.nodes
+                                else "Run cg analyze to add Python functions and methods.")
             return
         try:
             if self.focus_path:
@@ -556,6 +628,7 @@ class Viewer:
 
     def select_resource(self, resource_id):
         self.focus_resource, self.focus_id, self.focus_path = resource_id, None, None
+        self.orphan_note = None
         self.symbols.selection_remove(*self.symbols.selection())
         self.file_tree.selection_remove(*self.file_tree.selection())
         self.reveal_node(resource_id)
@@ -581,20 +654,25 @@ class Viewer:
     def load_notes(self):
         notes = defaultdict(list)
         self.notes_error = None
+        entries = []
         try:
-            for note in self.project.annotations():
+            entries = self.project.annotations()
+            for note in entries:
                 notes[note["target_node_id"]].append(note)
         except (CodeGraphError, OSError, sqlite3.Error) as error:
             self.notes_error = str(error)
         self.notes_by_node = notes
+        self.notes_browser.set_notes(entries, self.nodes)
+        if self.orphan_note:
+            self.orphan_note = self.notes_browser.entries.get(self.orphan_note["id"])
 
     def render_notes(self):
         self.note_target = None
         self.add_note_button.state(["disabled"])
         if self.notes_error:
             text = self.notes_error
-        elif self.focus_id:
-            notes = self.notes_by_node.get(self.focus_id, ())
+        elif self.focus_id or self.orphan_note:
+            notes = (self.orphan_note,) if self.orphan_note else self.notes_by_node.get(self.focus_id, ())
             text = "\n\n".join(
                 f'{note["type"]} · {note["status"]}\n{note["text"]}'
                 for note in sorted(notes, key=lambda item: (item["created_at"], item["id"]))
@@ -619,9 +697,43 @@ class Viewer:
             self.project.annotate(node_id, "NOTE", body)
         except (OSError, sqlite3.Error) as error:
             raise CodeGraphError(f"Cannot save note: {error}") from error
+        self.refresh_notes()
+
+    def refresh_notes(self):
         self.load_notes()
-        self.draw_graph()
+        self.restore_viewport(self.viewport())
         self.render_selection()
+
+    def select_note(self, note):
+        target = note["target_node_id"]
+        if target in self.node_items:
+            self.select_symbol(target)
+        else:
+            self.clear_focus(orphan_note=note)
+
+    def edit_note(self, note):
+        from .note_editor import open_note_editor
+
+        if note:
+            open_note_editor(self.root, self.COLORS, self.notes_browser.target_name(note),
+                             lambda body: self.change_note(note, body), body=note["text"])
+
+    def delete_note(self, note):
+        from tkinter import messagebox
+
+        if note and messagebox.askyesno("Delete note", "Delete the selected note?",
+                                        parent=self.root, default=messagebox.NO):
+            try:
+                self.change_note(note, None)
+            except CodeGraphError as error:
+                self.status.set(str(error))
+
+    def change_note(self, note, body):
+        try:
+            self.project.change_annotation(note["id"], body, expected_text=note["text"])
+        except (OSError, sqlite3.Error) as error:
+            raise CodeGraphError(f"Cannot save note: {error}") from error
+        self.refresh_notes()
 
     def show_source(self, source, ref):
         self.source.configure(state="normal")
@@ -701,6 +813,9 @@ class Viewer:
     def start_graph_drag(self, event):
         self.graph.focus_set()
         self.drag_origin = event.x, event.y
+        current = self.graph.find_withtag("current")
+        self.drag_node = self.graph_nodes.get(current[0]) if current else None
+        self.drag_position = self.layout[1].get(self.drag_node)
         self.dragging = False
         self.graph.scan_mark(event.x, event.y)
 
@@ -709,12 +824,61 @@ class Viewer:
             x, y = self.drag_origin
             if self.dragging or max(abs(event.x - x), abs(event.y - y)) >= 4:
                 self.dragging = True
-                self.graph.scan_dragto(event.x, event.y, gain=1)
+                if self.drag_node is None:
+                    self.graph.scan_dragto(event.x, event.y, gain=1)
+                else:
+                    start_x, start_y = self.drag_position
+                    point = (max(NODE_WIDTH / 2 + 18, start_x + (event.x - x) / self.scale),
+                             max(NODE_HEIGHT / 2 + 18, start_y + (event.y - y) / self.scale))
+                    self.move_node(self.drag_node, point)
 
     def end_graph_drag(self, event):
         if self.drag_origin and not self.dragging:
             self.graph_clicked(event)
+        elif self.drag_node and self.layout[1][self.drag_node] != self.drag_position:
+            point = self.layout[1][self.drag_node]
+            mode = self.layout_mode.get()
+            try:
+                self.project.save_view_position(mode, self.drag_node, point)
+                self.manual_positions.setdefault(mode, {})[self.drag_node] = list(point)
+            except (CodeGraphError, OSError, sqlite3.Error) as error:
+                self.status.set(f"Could not save node position: {error}")
+            self.restore_viewport(self.viewport())
         self.drag_origin = None
+        self.drag_node = None
+        self.drag_position = None
+
+    def move_node(self, node_id, point):
+        canvas, scale = self.graph, self.scale
+        positions = self.layout[1]
+        old_x, old_y = positions[node_id]
+        positions[node_id] = point
+        self.fitting = False
+        self.expand_layout()
+        width, height = self.layout[2]
+        canvas.configure(scrollregion=(0, 0, width * scale, height * scale))
+        items = self.node_items if node_id in self.node_items else self.resource_items
+        marker = (self.note_markers[node_id],) if node_id in self.note_markers else ()
+        for item in (*items[node_id], *marker):
+            canvas.move(item, (point[0] - old_x) * scale, (point[1] - old_y) * scale)
+        self.move_edges(node_id, self.edges, self.edge_items)
+        if self.io_enabled.get():
+            self.move_edges(node_id, self.io["edges"], self.io_items, with_labels=True)
+
+    def move_edges(self, node_id, edges, items, *, with_labels=False):
+        positions = self.layout[1]
+        ports = edge_ports(edges, positions)
+        for edge in edges:
+            start, end = edge["from_id"], edge["to_id"]
+            if node_id not in (start, end):
+                continue
+            points = edge_path(positions[start], positions[end], ports[edge["id"]])
+            item = items[edge["id"]]
+            if with_labels:
+                item, label = item
+                self.graph.coords(label, (points[2] + points[4]) * self.scale / 2,
+                                  (points[3] + points[5]) * self.scale / 2)
+            self.graph.coords(item, *(value * self.scale for value in points))
 
     def zoom(self, factor, anchor=None):
         if not self.nodes:
