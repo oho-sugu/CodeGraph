@@ -53,6 +53,8 @@ uv run --locked cg --project $project inspect --annotations --format json
 
 `.codegraph/annotations/annotations.jsonl` に注釈の正本を保存します。注釈対象の変更や削除は、再解析後に `NEEDS_REVIEW` または `ORPHANED` として確認できます。`graph.db` を再構築するときは `cg analyze` を実行します。
 
+このリポジトリをセルフ解析してできる `.codegraph/` は、フォルダ全体を Git の除外対象にしています。
+
 ## 別のプロジェクトを解析する
 
 CodeGraph のチェックアウトと、解析したい Python プロジェクトの絶対パスを指定します。次の PowerShell コマンドはどちらのディレクトリからでも実行できます。
